@@ -81,8 +81,8 @@ MULTISTOP_LIBRARY_FORWARD = {
     },
     "Macquarie Park Station": {
         "name": "Macquarie Park Station",
-        "lat": -33.77430,
-        "lng": 151.11920,
+        "lat": -33.78547,
+        "lng": 151.12910,
     },
     "Top Ryde City": {
         "name": "Top Ryde City",
@@ -109,8 +109,8 @@ MULTISTOP_LIBRARY_REVERSE = {
     },
     "Macquarie Park Station": {
         "name": "Macquarie Park Station",
-        "lat": -33.77405,
-        "lng": 151.11955,
+        "lat": -33.78547,
+        "lng": 151.12910,
     },
     "Macquarie Centre": {
         "name": "Macquarie Centre",
@@ -902,6 +902,132 @@ def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> 
         "route_kind": route_kind,
     }
 
+def _concat_path_points(legs: List[dict]) -> List[Tuple[float, float]]:
+    combined: List[Tuple[float, float]] = []
+
+    for i, leg in enumerate(legs):
+        leg_points = leg.get("path_points", []) or []
+        if not leg_points:
+            continue
+
+        if i == 0:
+            combined.extend(leg_points)
+        else:
+            combined.extend(leg_points[1:])
+
+    return combined
+
+
+def _build_combined_route_from_legs(
+    legs: List[dict],
+    route_id: str,
+) -> dict:
+    duration_s = sum(float(leg.get("duration_s", 0.0)) for leg in legs)
+    distance_m = sum(float(leg.get("distance_m", 0.0)) for leg in legs)
+
+    path_points = _concat_path_points(legs)
+
+    steps: List[str] = []
+    leg_durations_s: List[float] = []
+    leg_distances_m: List[float] = []
+    toll_status = False
+
+    for leg in legs:
+        steps.extend(leg.get("steps", []) or [])
+        leg_durations_s.append(float(leg.get("duration_s", 0.0)))
+        leg_distances_m.append(float(leg.get("distance_m", 0.0)))
+        toll_status = toll_status or bool(leg.get("toll_status"))
+
+    return {
+        "route_id": route_id,
+        "duration_s": duration_s,
+        "distance_m": distance_m,
+        "path_points": path_points,
+        "toll_status": toll_status,
+        "steps": steps,
+        "leg_durations_s": leg_durations_s,
+        "leg_distances_m": leg_distances_m,
+        "route_labels": ["COMBINED_MULTILEG"],
+    }
+
+
+def _build_stop_preserving_alternatives(
+    origin: dict,
+    destination: dict,
+    selected_stops: List[dict],
+    depart_dt: datetime.datetime,
+    avoid_tolls: bool,
+) -> List[dict]:
+    nodes = [origin] + selected_stops + [destination]
+    if len(nodes) < 2:
+        return []
+
+    all_leg_options: List[List[dict]] = []
+
+    for i in range(len(nodes) - 1):
+        leg_origin = nodes[i]
+        leg_destination = nodes[i + 1]
+
+        leg_routes = _compute_route_google(
+            origin=leg_origin,
+            destination=leg_destination,
+            selected_stops=[],
+            depart_dt=depart_dt,
+            avoid_tolls=avoid_tolls,
+            fastest_route_only=False,
+            allow_alternatives=True,
+        )
+
+        if not leg_routes:
+            return []
+
+        all_leg_options.append(leg_routes)
+
+    combinations: List[List[int]] = []
+    base_combo = [0] * len(all_leg_options)
+    combinations.append(base_combo)
+
+    for leg_idx, leg_options in enumerate(all_leg_options):
+        max_alt_index = min(len(leg_options) - 1, 2)
+        for alt_idx in range(1, max_alt_index + 1):
+            combo = [0] * len(all_leg_options)
+            combo[leg_idx] = alt_idx
+            combinations.append(combo)
+
+    built_routes: List[dict] = []
+    seen_keys = set()
+
+    for combo_idx, combo in enumerate(combinations, start=1):
+        chosen_legs = [
+            all_leg_options[leg_i][choice_idx]
+            for leg_i, choice_idx in enumerate(combo)
+        ]
+
+        combined = _build_combined_route_from_legs(
+            chosen_legs,
+            route_id=f"R{combo_idx}",
+        )
+
+        key = (
+            round(float(combined["duration_s"]), 1),
+            round(float(combined["distance_m"]), 1),
+            tuple(
+                (
+                    round(float(p[0]), 5),
+                    round(float(p[1]), 5),
+                )
+                for p in combined.get("path_points", [])[:40]
+            ),
+        )
+
+        if key in seen_keys:
+            continue
+
+        seen_keys.add(key)
+        built_routes.append(combined)
+
+    return built_routes
+
 
 def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
     saved_trip = request_data["saved_trip"]
@@ -952,38 +1078,39 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
 
         best = ranked_stop_routes[0]
 
-        reference_routes = []
-        if (len(ranked_stop_routes) <= 1) and (not fastest_route_only):
+        if (len(ranked_stop_routes) <= 1) and (not fastest_route_only) and selected_stops:
             try:
-                od_only_routes_raw = _compute_route_google(
+                combined_alt_routes_raw = _build_stop_preserving_alternatives(
                     origin=origin,
                     destination=destination,
-                    selected_stops=[],
+                    selected_stops=selected_stops,
                     depart_dt=depart_dt,
                     avoid_tolls=avoid_tolls,
-                    fastest_route_only=False,
-                    allow_alternatives=True,
                 )
-                enriched_od_routes = [
+
+                enriched_combined_routes = [
                     _enrich_route_metrics(
                         route=r,
                         passengers=passengers,
                         depart_dt=depart_dt,
-                        selected_stops=[],
+                        selected_stops=selected_stops,
                     )
-                    for r in od_only_routes_raw
+                    for r in combined_alt_routes_raw
                 ]
-                reference_routes = _rank_routes_balanced(
-                    enriched_od_routes,
+
+                ranked_stop_routes = _rank_routes_balanced(
+                    enriched_combined_routes,
                     fastest_route_only=False,
                 )
-                for idx, r in enumerate(reference_routes, start=1):
-                    r["route_id"] = f"REF-{idx}"
+
+                for idx, r in enumerate(ranked_stop_routes, start=1):
+                    r["route_id"] = f"R{idx}"
                     r["arrival_time"] = (
                         depart_dt + datetime.timedelta(seconds=float(r["duration_s"]))
                     ).strftime("%H:%M")
             except Exception:
-                reference_routes = []
+                pass        
+
 
         duration_s = float(best["duration_s"])
         if trip_type == "round":
@@ -1026,15 +1153,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 )
             )
 
-        for route in reference_routes:
-            all_routes_payload.append(
-                _route_payload(
-                    route,
-                    route_kind="reference_alternative_without_stops",
-                    selected_stops=[],
-                )
-            )
-
+        
         return {
             "selected_route": {
                 "route_id": best["route_id"],
