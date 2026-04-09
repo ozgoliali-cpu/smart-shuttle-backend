@@ -12,6 +12,7 @@ SYD_ZONEINFO = ZoneInfo("Australia/Sydney")
 ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 PLACES_NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+ELEVATION_API_URL = "https://maps.googleapis.com/maps/api/elevation/json"
 
 PLACE_TYPES_TRANSIT = [
     "bus_station",
@@ -53,6 +54,10 @@ DEFAULT_SHUTTLE = {
     "start_soc_pct_default": 90.0,
     "reserve_soc_pct": 20.0,
     "grid_emission_factor_kg_per_kwh": 0.64,
+    "vehicle_mass_kg": 2980.0,
+    "avg_passenger_mass_kg": 75.0,
+    "driveline_efficiency_uphill": 0.90,
+    "regen_efficiency_downhill": 0.55,
 }
 
 SOC_BUFFER_PP = 0.5
@@ -719,6 +724,117 @@ def _estimate_hvac_power_kw(outdoor_temp_c: float, passengers: int) -> float:
 
     return max(0.6, min(hvac_kw, 6.0))
 
+def _sample_polyline_for_elevation(
+    points: List[Tuple[float, float]],
+    max_points: int = 32,
+) -> List[Tuple[float, float]]:
+    if not points:
+        return []
+    if len(points) <= max_points:
+        return points
+
+    out = []
+    for i in range(max_points):
+        idx = round(i * (len(points) - 1) / (max_points - 1))
+        out.append(points[idx])
+    return out
+
+
+def _fetch_elevations_for_points(
+    points: List[Tuple[float, float]],
+) -> List[float]:
+    if not GOOGLE_API_KEY or not points:
+        return []
+
+    sampled_points = _sample_polyline_for_elevation(points, max_points=32)
+    locations_param = "|".join(
+        f"{lat:.6f},{lng:.6f}" for lat, lng in sampled_points
+    )
+
+    try:
+        response = requests.get(
+            ELEVATION_API_URL,
+            params={
+                "locations": locations_param,
+                "key": GOOGLE_API_KEY,
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+        results = payload.get("results", []) or []
+        elevations = []
+        for item in results:
+            elev = item.get("elevation")
+            if elev is None:
+                return []
+            elevations.append(float(elev))
+
+        return elevations
+    except Exception:
+        return []
+
+
+def _estimate_slope_energy_adjustment_kwh(
+    route_row: dict,
+    passengers: int,
+) -> dict:
+    path_points = route_row.get("path_points", []) or []
+    sampled_points = _sample_polyline_for_elevation(path_points, max_points=32)
+    elevations_m = _fetch_elevations_for_points(sampled_points)
+
+    if len(sampled_points) < 2 or len(sampled_points) != len(elevations_m):
+        return {
+            "uphill_kwh": 0.0,
+            "regen_kwh": 0.0,
+            "net_kwh": 0.0,
+            "elevation_api_used": False,
+        }
+
+    total_mass_kg = (
+        DEFAULT_SHUTTLE["vehicle_mass_kg"]
+        + max(passengers, 0) * DEFAULT_SHUTTLE["avg_passenger_mass_kg"]
+    )
+
+    uphill_kwh = 0.0
+    regen_kwh = 0.0
+
+    for i in range(len(sampled_points) - 1):
+        lat1, lng1 = sampled_points[i]
+        lat2, lng2 = sampled_points[i + 1]
+
+        horiz_m = _haversine_m(lat1, lng1, lat2, lng2)
+        if horiz_m < 5.0:
+            continue
+
+        delta_h_m = elevations_m[i + 1] - elevations_m[i]
+
+        if abs(delta_h_m) < 1.0:
+            continue
+
+        potential_kwh = (
+            total_mass_kg * 9.81 * abs(delta_h_m)
+        ) / 3_600_000.0
+
+        if delta_h_m > 0:
+            uphill_kwh += (
+                potential_kwh / DEFAULT_SHUTTLE["driveline_efficiency_uphill"]
+            )
+        else:
+            regen_kwh += (
+                potential_kwh * DEFAULT_SHUTTLE["regen_efficiency_downhill"]
+            )
+
+    net_kwh = uphill_kwh - regen_kwh
+
+    return {
+        "uphill_kwh": round(uphill_kwh, 3),
+        "regen_kwh": round(regen_kwh, 3),
+        "net_kwh": round(net_kwh, 3),
+        "elevation_api_used": True,
+    }
+
 def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime.datetime) -> dict:
     distance_km = float(route_row["distance_m"]) / 1000.0
     duration_h = float(route_row["duration_s"]) / 3600.0
@@ -726,13 +842,40 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
     base_kwh_per_km = DEFAULT_SHUTTLE["kwh_per_km_baseline"]
     passenger_factor = 1.0 + 0.015 * passengers
 
-    traction_kwh = distance_km * base_kwh_per_km * passenger_factor
+    traction_base_kwh = distance_km * base_kwh_per_km * passenger_factor
 
-    mid_lat, mid_lng = _route_midpoint_lat_lng(route_row)
-    outdoor_temp_c = _fetch_outdoor_temp_c(mid_lat, mid_lng, depart_dt)
+    slope_adj = _estimate_slope_energy_adjustment_kwh(route_row, passengers)
+    slope_net_kwh = float(slope_adj["net_kwh"])
 
-    hvac_kw = _estimate_hvac_power_kw(outdoor_temp_c, passengers)
-    hvac_kwh = hvac_kw * duration_h
+    max_downhill_credit_kwh = 0.35 * traction_base_kwh
+    slope_net_kwh = max(slope_net_kwh, -max_downhill_credit_kwh)
+
+    traction_kwh = max(0.0, traction_base_kwh + slope_net_kwh)
+
+    outdoor_temp_c = None
+    hvac_kw = 0.0
+    hvac_kwh = 0.0
+
+    if (
+        "_route_midpoint_lat_lng" in globals()
+        and "_fetch_outdoor_temp_c" in globals()
+        and "_estimate_hvac_power_kw" in globals()
+    ):
+        mid_lat, mid_lng = _route_midpoint_lat_lng(route_row)
+        outdoor_temp_c = _fetch_outdoor_temp_c(mid_lat, mid_lng, depart_dt)
+        hvac_kw = _estimate_hvac_power_kw(outdoor_temp_c, passengers)
+        hvac_kwh = hvac_kw * duration_h
+    else:
+        month = depart_dt.month
+        if month in [12, 1, 2]:
+            hvac_factor = 1.15
+        elif month in [6, 7, 8]:
+            hvac_factor = 1.10
+        else:
+            hvac_factor = 1.05
+
+        hvac_kwh = max(0.0, (hvac_factor - 1.0) * traction_base_kwh)
+        hvac_kw = hvac_kwh / duration_h if duration_h > 0 else 0.0
 
     onboard_kw = DEFAULT_SHUTTLE["onboard_systems_kw"]
     device_kw = (
@@ -751,12 +894,17 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
     return {
         "total_kwh": round(total_kwh, 2),
         "traction_kwh": round(traction_kwh, 2),
+        "traction_base_kwh": round(traction_base_kwh, 2),
+        "slope_uphill_kwh": round(float(slope_adj["uphill_kwh"]), 2),
+        "slope_regen_kwh": round(float(slope_adj["regen_kwh"]), 2),
+        "slope_net_kwh": round(float(slope_net_kwh), 2),
+        "elevation_api_used": bool(slope_adj["elevation_api_used"]),
         "auxiliary_kwh": round(auxiliary_kwh, 2),
         "onboard_kwh": round(onboard_kwh, 2),
         "device_kwh": round(device_kwh, 2),
         "hvac_kwh": round(hvac_kwh, 2),
         "hvac_kw_est": round(hvac_kw, 2),
-        "outdoor_temp_c": round(outdoor_temp_c, 1),
+        "outdoor_temp_c": round(outdoor_temp_c, 1) if outdoor_temp_c is not None else None,
         "avg_trip_power_kw": round(avg_trip_power_kw, 2),
         "avg_speed_kmh": round(avg_speed_kmh, 1),
     }
@@ -942,6 +1090,11 @@ def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> 
         "auxiliary_kwh": route["energy"]["auxiliary_kwh"],
         "onboard_kwh": route["energy"]["onboard_kwh"],
         "device_kwh": route["energy"]["device_kwh"],
+        "traction_base_kwh": route["energy"]["traction_base_kwh"],
+        "slope_uphill_kwh": route["energy"]["slope_uphill_kwh"],
+        "slope_regen_kwh": route["energy"]["slope_regen_kwh"],
+        "slope_net_kwh": route["energy"]["slope_net_kwh"],
+        "elevation_api_used": route["energy"]["elevation_api_used"],
         "hvac_kwh": route["energy"]["hvac_kwh"],
         "hvac_kw_est": route["energy"]["hvac_kw_est"],
         "outdoor_temp_c": route["energy"]["outdoor_temp_c"],
