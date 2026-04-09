@@ -651,12 +651,23 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
     passenger_factor = 1.0 + 0.015 * passengers
 
     month = depart_dt.month
+    hour = depart_dt.hour
+
     if month in [12, 1, 2]:
-        hvac_factor = 1.15
+        seasonal_hvac_factor = 1.14
     elif month in [6, 7, 8]:
-        hvac_factor = 1.10
+        seasonal_hvac_factor = 1.10
     else:
-        hvac_factor = 1.05
+        seasonal_hvac_factor = 1.05
+
+    if 7 <= hour <= 9 or 16 <= hour <= 18:
+        daily_hvac_factor = 1.03
+    elif 11 <= hour <= 15:
+        daily_hvac_factor = 1.02
+    else:
+        daily_hvac_factor = 1.00
+
+    hvac_factor = seasonal_hvac_factor * daily_hvac_factor
 
     traction_kwh = distance_km * base_kwh_per_km * passenger_factor * hvac_factor
 
