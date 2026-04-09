@@ -1232,7 +1232,7 @@ def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> 
         "tolls": "Toll applies" if route.get("toll_status") else "No toll",
         "route_sustainability_index": route["route_sustainability_index"],
         "score": round(route["score"], 4),
-	"pareto_front_rank": route.get("pareto_front_rank"),
+        "pareto_front_rank": route.get("pareto_front_rank"),                
         "topsis_closeness": route.get("topsis_closeness"),
         "recommendation_basis": route.get("recommendation_basis", ""),
         "route_points": [
