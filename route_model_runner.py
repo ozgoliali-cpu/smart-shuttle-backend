@@ -11,6 +11,7 @@ SYD_ZONEINFO = ZoneInfo("Australia/Sydney")
 
 ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 PLACES_NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
 PLACE_TYPES_TRANSIT = [
     "bus_station",
@@ -642,6 +643,81 @@ def _search_nearby_chargers_along_route(
 
     return final_deduped
 
+_weather_cache: Dict[Tuple[float, float, str], float] = {}
+
+
+def _route_midpoint_lat_lng(route_row: dict) -> Tuple[float, float]:
+    path_points = route_row.get("path_points", []) or []
+
+    if path_points:
+        mid_idx = len(path_points) // 2
+        mid_lat, mid_lng = path_points[mid_idx]
+        return float(mid_lat), float(mid_lng)
+
+    return float(MU["lat"]), float(MU["lng"])
+
+
+def _fetch_outdoor_temp_c(lat: float, lng: float, target_dt: datetime.datetime) -> float:
+    hour_dt = target_dt.astimezone(SYD_ZONEINFO).replace(
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+
+    cache_key = (round(lat, 4), round(lng, 4), hour_dt.isoformat())
+    if cache_key in _weather_cache:
+        return _weather_cache[cache_key]
+
+    params = {
+        "latitude": lat,
+        "longitude": lng,
+        "hourly": "temperature_2m",
+        "timezone": "Australia/Sydney",
+        "start_hour": hour_dt.strftime("%Y-%m-%dT%H:00"),
+        "end_hour": hour_dt.strftime("%Y-%m-%dT%H:00"),
+        "forecast_days": 3,
+        "past_days": 1,
+    }
+
+    try:
+        response = requests.get(OPEN_METEO_URL, params=params, timeout=12)
+        response.raise_for_status()
+        payload = response.json()
+
+        hourly = payload.get("hourly", {}) or {}
+        temps = hourly.get("temperature_2m", []) or []
+
+        if temps:
+            temp_c = float(temps[0])
+            _weather_cache[cache_key] = temp_c
+            return temp_c
+    except Exception:
+        pass
+
+    fallback_by_month = {
+        1: 24.0, 2: 24.0, 3: 22.0,
+        4: 19.0, 5: 16.0, 6: 13.0,
+        7: 12.0, 8: 14.0, 9: 17.0,
+        10: 20.0, 11: 22.0, 12: 24.0,
+    }
+    return float(fallback_by_month.get(target_dt.month, 20.0))
+
+
+def _estimate_hvac_power_kw(outdoor_temp_c: float, passengers: int) -> float:
+    cooling_setpoint_c = 24.0
+    heating_setpoint_c = 20.0
+
+    if outdoor_temp_c > cooling_setpoint_c:
+        hvac_kw = 1.2 + 0.22 * (outdoor_temp_c - cooling_setpoint_c)
+    elif outdoor_temp_c < heating_setpoint_c:
+        hvac_kw = 1.0 + 0.18 * (heating_setpoint_c - outdoor_temp_c)
+    else:
+        hvac_kw = 0.6
+
+    passenger_hvac_factor = 1.0 + 0.01 * passengers
+    hvac_kw *= passenger_hvac_factor
+
+    return max(0.6, min(hvac_kw, 6.0))
 
 def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime.datetime) -> dict:
     distance_km = float(route_row["distance_m"]) / 1000.0
@@ -650,26 +726,13 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
     base_kwh_per_km = DEFAULT_SHUTTLE["kwh_per_km_baseline"]
     passenger_factor = 1.0 + 0.015 * passengers
 
-    month = depart_dt.month
-    hour = depart_dt.hour
+    traction_kwh = distance_km * base_kwh_per_km * passenger_factor
 
-    if month in [12, 1, 2]:
-        seasonal_hvac_factor = 1.14
-    elif month in [6, 7, 8]:
-        seasonal_hvac_factor = 1.10
-    else:
-        seasonal_hvac_factor = 1.05
+    mid_lat, mid_lng = _route_midpoint_lat_lng(route_row)
+    outdoor_temp_c = _fetch_outdoor_temp_c(mid_lat, mid_lng, depart_dt)
 
-    if 7 <= hour <= 9 or 16 <= hour <= 18:
-        daily_hvac_factor = 1.03
-    elif 11 <= hour <= 15:
-        daily_hvac_factor = 1.02
-    else:
-        daily_hvac_factor = 1.00
-
-    hvac_factor = seasonal_hvac_factor * daily_hvac_factor
-
-    traction_kwh = distance_km * base_kwh_per_km * passenger_factor * hvac_factor
+    hvac_kw = _estimate_hvac_power_kw(outdoor_temp_c, passengers)
+    hvac_kwh = hvac_kw * duration_h
 
     onboard_kw = DEFAULT_SHUTTLE["onboard_systems_kw"]
     device_kw = (
@@ -679,7 +742,7 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
 
     onboard_kwh = onboard_kw * duration_h
     device_kwh = device_kw * duration_h
-    auxiliary_kwh = onboard_kwh + device_kwh
+    auxiliary_kwh = onboard_kwh + device_kwh + hvac_kwh
     total_kwh = traction_kwh + auxiliary_kwh
 
     avg_trip_power_kw = total_kwh / duration_h if duration_h > 0 else 0.0
@@ -691,7 +754,9 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
         "auxiliary_kwh": round(auxiliary_kwh, 2),
         "onboard_kwh": round(onboard_kwh, 2),
         "device_kwh": round(device_kwh, 2),
-        "hvac_kw_est": round((hvac_factor - 1.0) * traction_kwh, 2),
+        "hvac_kwh": round(hvac_kwh, 2),
+        "hvac_kw_est": round(hvac_kw, 2),
+        "outdoor_temp_c": round(outdoor_temp_c, 1),
         "avg_trip_power_kw": round(avg_trip_power_kw, 2),
         "avg_speed_kmh": round(avg_speed_kmh, 1),
     }
@@ -877,6 +942,9 @@ def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> 
         "auxiliary_kwh": route["energy"]["auxiliary_kwh"],
         "onboard_kwh": route["energy"]["onboard_kwh"],
         "device_kwh": route["energy"]["device_kwh"],
+        "hvac_kwh": route["energy"]["hvac_kwh"],
+        "hvac_kw_est": route["energy"]["hvac_kw_est"],
+        "outdoor_temp_c": route["energy"]["outdoor_temp_c"],
         "avg_trip_power_kw": route["energy"]["avg_trip_power_kw"],
         "energy_per_km": route["sustainability_metrics"]["energy_per_km"],
         "energy_per_passenger_km": route["sustainability_metrics"]["energy_per_passenger_km"],
