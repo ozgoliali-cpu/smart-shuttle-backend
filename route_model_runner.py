@@ -948,63 +948,181 @@ def _hours_to_mmss(hours_value: float) -> str:
     seconds = total_seconds % 60
     return f"{minutes:02d}:{seconds:02d}"
 
+def _route_cost_vector(route: dict) -> Dict[str, float]:
+    travel_time_min = float(route["duration_s"]) / 60.0
+    distance_km = float(route["distance_m"]) / 1000.0
+    total_kwh = float(route["energy"]["total_kwh"])
+    end_soc_pct = float(route["soc"]["end_soc_pct"])
+    reserve_pct = float(route["soc"].get("effective_reserve_pct", route["soc"]["reserve_soc_pct"]))
+    soc_deficit_pct = max(0.0, reserve_pct - end_soc_pct)
+    toll_penalty = 1.0 if route.get("toll_status") else 0.0
+
+    return {
+        "travel_time_min": travel_time_min,
+        "distance_km": distance_km,
+        "total_kwh": total_kwh,
+        "soc_deficit_pct": soc_deficit_pct,
+        "toll_penalty": toll_penalty,
+    }
+
+
+def _is_route_feasible(route: dict) -> bool:
+    end_soc_pct = float(route["soc"]["end_soc_pct"])
+    reserve_pct = float(route["soc"].get("effective_reserve_pct", route["soc"]["reserve_soc_pct"]))
+    return end_soc_pct >= reserve_pct
+
+
+def _dominates(cost_a: Dict[str, float], cost_b: Dict[str, float]) -> bool:
+    keys = list(cost_a.keys())
+    no_worse = all(cost_a[k] <= cost_b[k] for k in keys)
+    strictly_better = any(cost_a[k] < cost_b[k] for k in keys)
+    return no_worse and strictly_better
+
+
+def _non_dominated_fronts(routes: List[dict]) -> List[List[dict]]:
+    remaining = list(routes)
+    fronts: List[List[dict]] = []
+
+    while remaining:
+        front = []
+        for candidate in remaining:
+            candidate_cost = _route_cost_vector(candidate)
+            dominated = False
+
+            for other in remaining:
+                if other is candidate:
+                    continue
+                other_cost = _route_cost_vector(other)
+                if _dominates(other_cost, candidate_cost):
+                    dominated = True
+                    break
+
+            if not dominated:
+                front.append(candidate)
+
+        if not front:
+            front = [remaining[0]]
+
+        fronts.append(front)
+        front_ids = {id(r) for r in front}
+        remaining = [r for r in remaining if id(r) not in front_ids]
+
+    return fronts
+
+
+def _topsis_closeness(routes: List[dict], weights: Dict[str, float]) -> Dict[int, float]:
+    if not routes:
+        return {}
+
+    criteria = list(weights.keys())
+    cost_rows = [_route_cost_vector(r) for r in routes]
+
+    denom = {}
+    for c in criteria:
+        denom[c] = math.sqrt(sum((row[c] ** 2) for row in cost_rows))
+        if denom[c] == 0:
+            denom[c] = 1.0
+
+    weighted_rows = []
+    for row in cost_rows:
+        weighted = {}
+        for c in criteria:
+            weighted[c] = (row[c] / denom[c]) * weights[c]
+        weighted_rows.append(weighted)
+
+    ideal_best = {c: min(row[c] for row in weighted_rows) for c in criteria}
+    ideal_worst = {c: max(row[c] for row in weighted_rows) for c in criteria}
+
+    closeness: Dict[int, float] = {}
+    for route, row in zip(routes, weighted_rows):
+        d_best = math.sqrt(sum((row[c] - ideal_best[c]) ** 2 for c in criteria))
+        d_worst = math.sqrt(sum((row[c] - ideal_worst[c]) ** 2 for c in criteria))
+
+        if d_best + d_worst == 0:
+            coeff = 1.0
+        else:
+            coeff = d_worst / (d_best + d_worst)
+
+        closeness[id(route)] = round(coeff, 6)
+
+    return closeness
+
+
+def _assign_rank_metadata(
+    fronts: List[List[dict]],
+    fastest_route_only: bool,
+) -> List[dict]:
+    ranked: List[dict] = []
+
+    if fastest_route_only:
+        ordered = sorted(fronts[0] if fronts else [], key=lambda r: float(r["duration_s"]))
+        for pos, route in enumerate(ordered, start=1):
+            item = dict(route)
+            item["pareto_front_rank"] = 1
+            item["topsis_closeness"] = round(
+                1.0 if len(ordered) == 1 else 1.0 - ((pos - 1) / (len(ordered) - 1)),
+                6,
+            )
+            item["score"] = round(float(route["duration_s"]) / 60.0, 6)
+            item["route_sustainability_index"] = round(
+                1.0 if len(ordered) == 1 else max(0.30, 1.0 - 0.70 * ((pos - 1) / (len(ordered) - 1))),
+                3,
+            )
+            item["recommendation_basis"] = "Fastest feasible route selection"
+            ranked.append(item)
+        return ranked
+
+    weights = {
+        "travel_time_min": 0.25,
+        "distance_km": 0.15,
+        "total_kwh": 0.35,
+        "soc_deficit_pct": 0.15,
+        "toll_penalty": 0.10,
+    }
+
+    for front_rank, front in enumerate(fronts, start=1):
+        closeness = _topsis_closeness(front, weights=weights)
+        ordered_front = sorted(
+            front,
+            key=lambda r: (-closeness.get(id(r), 0.0), float(r["duration_s"]), float(r["distance_m"])),
+        )
+
+        for route in ordered_front:
+            c = closeness.get(id(route), 0.0)
+            item = dict(route)
+            item["pareto_front_rank"] = front_rank
+            item["topsis_closeness"] = round(c, 6)
+            item["score"] = round((front_rank - 1) + (1.0 - c), 6)
+
+            front_factor = 1.0 / front_rank
+            sustainability_index = 0.20 + 0.80 * ((0.65 * c) + (0.35 * front_factor))
+            item["route_sustainability_index"] = round(min(1.0, max(0.20, sustainability_index)), 3)
+
+            item["recommendation_basis"] = (
+                "Constrained multi-objective ranking using Pareto-front screening "
+                "followed by TOPSIS compromise selection across travel time, "
+                "distance, total energy, SOC reserve compliance and toll exposure"
+            )
+            ranked.append(item)
+
+    return ranked
 
 def _rank_routes_balanced(routes: List[dict], fastest_route_only: bool) -> List[dict]:
     if not routes:
         return []
 
-    durations = [float(r["duration_s"]) for r in routes]
-    distances = [float(r["distance_m"]) for r in routes]
-    energies = [float(r["energy"]["total_kwh"]) for r in routes]
-    emissions = [float(r["sustainability_metrics"]["emissions_kg_co2e"]) for r in routes]
+    feasible_routes = [r for r in routes if _is_route_feasible(r)]
+    working_routes = feasible_routes if feasible_routes else list(routes)
 
-    min_duration, max_duration = min(durations), max(durations)
-    min_distance, max_distance = min(distances), max(distances)
-    min_energy, max_energy = min(energies), max(energies)
-    min_emissions, max_emissions = min(emissions), max(emissions)
+    if fastest_route_only:
+        ordered = sorted(working_routes, key=lambda r: float(r["duration_s"]))
+        return _assign_rank_metadata([ordered], fastest_route_only=True)
 
-    def norm(v: float, v_min: float, v_max: float) -> float:
-        if v_max <= v_min:
-            return 0.0
-        return (v - v_min) / (v_max - v_min)
+    fronts = _non_dominated_fronts(working_routes)
+    ranked = _assign_rank_metadata(fronts, fastest_route_only=False)
+    ranked.sort(key=lambda x: (x["pareto_front_rank"], x["score"]))
 
-    ranked = []
-
-    for r in routes:
-        duration_norm = norm(float(r["duration_s"]), min_duration, max_duration)
-        distance_norm = norm(float(r["distance_m"]), min_distance, max_distance)
-        energy_norm = norm(float(r["energy"]["total_kwh"]), min_energy, max_energy)
-        emissions_norm = norm(
-            float(r["sustainability_metrics"]["emissions_kg_co2e"]),
-            min_emissions,
-            max_emissions,
-        )
-
-        if fastest_route_only:
-            score = duration_norm
-            basis = "Fastest-route selection"
-        else:
-            score = (
-                0.45 * energy_norm
-                + 0.25 * distance_norm
-                + 0.20 * emissions_norm
-                + 0.10 * duration_norm
-            )
-            basis = "Energy-first balanced routing across time, distance, energy use and grid-charging emissions"
-
-        score = max(0.0, min(1.0, score))
-
-        sustainability_index = round(0.20 + 0.80 * (1.0 - score), 3)
-
-        item = dict(r)
-        item["score"] = round(score, 6)
-        item["route_sustainability_index"] = sustainability_index
-        item["recommendation_basis"] = basis
-        ranked.append(item)
-
-    ranked.sort(key=lambda x: x["score"])
     return ranked
-
 
 def _queue_risk_from_charger_count(charger_count: int) -> str:
     if charger_count >= 7:
@@ -1114,6 +1232,8 @@ def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> 
         "tolls": "Toll applies" if route.get("toll_status") else "No toll",
         "route_sustainability_index": route["route_sustainability_index"],
         "score": round(route["score"], 4),
+	"pareto_front_rank": route.get("pareto_front_rank"),
+        "topsis_closeness": route.get("topsis_closeness"),
         "recommendation_basis": route.get("recommendation_basis", ""),
         "route_points": [
             {"lat": float(lat), "lng": float(lng)}
@@ -1310,8 +1430,6 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 depart_dt + datetime.timedelta(seconds=float(r["duration_s"]))
             ).strftime("%H:%M")
 
-        best = ranked_stop_routes[0]
-
         if (len(ranked_stop_routes) <= 1) and (not fastest_route_only) and selected_stops:
             try:
                 combined_alt_routes_raw = _build_stop_preserving_alternatives(
@@ -1331,6 +1449,21 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                     )
                     for r in combined_alt_routes_raw
                 ]
+
+                ranked_stop_routes = _rank_routes_balanced(
+                    enriched_combined_routes,
+                    fastest_route_only=False,
+                )
+
+                for idx, r in enumerate(ranked_stop_routes, start=1):
+                    r["route_id"] = f"R{idx}"
+                    r["arrival_time"] = (
+                        depart_dt + datetime.timedelta(seconds=float(r["duration_s"]))
+                    ).strftime("%H:%M")
+            except Exception:
+                pass
+
+        best = ranked_stop_routes[0]        
 
                 ranked_stop_routes = _rank_routes_balanced(
                     enriched_combined_routes,
@@ -1396,6 +1529,8 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 "arrival_time": selected_arrival_dt.strftime("%H:%M"),
                 "tolls": "Toll applies" if best.get("toll_status") else "No toll",
                 "sustainability_score": best["route_sustainability_index"],
+                "pareto_front_rank": best.get("pareto_front_rank"),
+                "topsis_closeness": best.get("topsis_closeness"),
                 "energy_saving_vs_highest_energy_route_pct": round(saving_vs_highest_pct, 1),
             },
             "energy": {
