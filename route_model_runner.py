@@ -1470,21 +1470,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
         best = ranked_stop_routes[0]
         duration_s = float(best["duration_s"])  
 
-                ranked_stop_routes = _rank_routes_balanced(
-                    enriched_combined_routes,
-                    fastest_route_only=False,
-                )
-
-                for idx, r in enumerate(ranked_stop_routes, start=1):
-                    r["route_id"] = f"R{idx}"
-                    r["arrival_time"] = (
-                        depart_dt + datetime.timedelta(seconds=float(r["duration_s"]))
-                    ).strftime("%H:%M")
-            except Exception:
-                pass        
-
-
-        duration_s = float(best["duration_s"])
+              
         if trip_type == "round":
             selected_arrival_dt = depart_dt + datetime.timedelta(seconds=duration_s * 2.0)
         else:
