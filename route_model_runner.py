@@ -761,14 +761,16 @@ def _rank_routes_balanced(routes: List[dict], fastest_route_only: bool) -> List[
             basis = "Fastest-route selection"
         else:
             score = (
-                0.50 * energy_norm
+                0.45 * energy_norm
                 + 0.25 * distance_norm
-                + 0.15 * emissions_norm
+                + 0.20 * emissions_norm
                 + 0.10 * duration_norm
             )
             basis = "Energy-first balanced routing across time, distance, energy use and grid-charging emissions"
 
-        sustainability_index = round(1.0 - score, 3)
+        score = max(0.0, min(1.0, score))
+
+        sustainability_index = round(0.20 + 0.80 * (1.0 - score), 3)
 
         item = dict(r)
         item["score"] = round(score, 6)
