@@ -298,6 +298,42 @@ def _estimate_stop_indices_from_polyline(
     return indices
 
 
+
+def _estimate_step_route_indices(
+    path_points: List[Tuple[float, float]],
+    step_details: List[dict],
+) -> List[dict]:
+    if not path_points or not step_details:
+        return step_details
+
+    last_idx = 0
+    out = []
+
+    for step in step_details:
+        poly_points = step.get("poly_points", []) or []
+        if poly_points:
+            ref_lat, ref_lng = poly_points[0]
+        else:
+            ref_lat, ref_lng = path_points[min(last_idx, len(path_points) - 1)]
+
+        best_idx = last_idx
+        best_dist = float("inf")
+
+        for idx in range(last_idx, len(path_points)):
+            p_lat, p_lng = path_points[idx]
+            d = _haversine_m(ref_lat, ref_lng, p_lat, p_lng)
+            if d < best_dist:
+                best_dist = d
+                best_idx = idx
+
+        item = dict(step)
+        item["route_index"] = best_idx
+        out.append(item)
+        last_idx = best_idx
+
+    return out
+
+
 def _places_nearby_search(
     included_types: List[str],
     lat: float,
@@ -486,6 +522,8 @@ def _compute_route_google(
             "routes.polyline.encodedPolyline,"
             "routes.legs.duration,"
             "routes.legs.distanceMeters,"
+            "routes.legs.steps.distanceMeters,"
+            "routes.legs.steps.polyline.encodedPolyline,"
             "routes.legs.steps.navigationInstruction.instructions,"
             "routes.travelAdvisory.tollInfo"
         ),
@@ -527,11 +565,28 @@ def _compute_route_google(
         ]
 
         steps = []
+        step_details = []
         for leg in legs:
             for step in leg.get("steps", []) or []:
                 instr = ((step.get("navigationInstruction") or {}).get("instructions"))
-                if instr:
-                    steps.append(instr)
+                if not instr:
+                    continue
+
+                steps.append(instr)
+
+                step_distance_m = float(step.get("distanceMeters", 0.0))
+                step_poly = ((step.get("polyline") or {}).get("encodedPolyline") or "")
+                step_poly_points = decode_google_polyline(step_poly) if step_poly else []
+
+                step_details.append(
+                    {
+                        "instruction": instr,
+                        "distance_m": step_distance_m,
+                        "poly_points": step_poly_points,
+                    }
+                )
+
+        step_details = _estimate_step_route_indices(path_points, step_details)
 
         toll_status = ((route.get("travelAdvisory") or {}).get("tollInfo")) is not None
         route_labels = route.get("routeLabels", []) or []
@@ -544,6 +599,7 @@ def _compute_route_google(
                 "path_points": path_points,
                 "toll_status": toll_status,
                 "steps": steps,
+                "step_details": step_details,
                 "leg_durations_s": leg_durations_s,
                 "leg_distances_m": leg_distances_m,
                 "route_labels": route_labels,
@@ -1239,6 +1295,14 @@ def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> 
             {"lat": float(lat), "lng": float(lng)}
             for lat, lng in route.get("path_points", [])
         ],
+        "step_details": [
+            {
+                "instruction": sd.get("instruction", ""),
+                "distance_m": round(float(sd.get("distance_m", 0.0)), 1),
+                "route_index": int(sd.get("route_index", 0)),
+            }
+            for sd in route.get("step_details", [])
+        ],
         "stop_indices": route.get("stop_indices", []),
         "stop_arrivals": route.get("stop_arrivals", []),
         "stop_points": [
@@ -1282,15 +1346,32 @@ def _build_combined_route_from_legs(
     path_points = _concat_path_points(legs)
 
     steps: List[str] = []
+    step_details: List[dict] = []
     leg_durations_s: List[float] = []
     leg_distances_m: List[float] = []
     toll_status = False
 
-    for leg in legs:
-        steps.extend(leg.get("steps", []) or [])
+    point_offset = 0
+
+    for leg_idx, leg in enumerate(legs):
+        leg_points = leg.get("path_points", []) or []
+        leg_steps = leg.get("steps", []) or []
+        leg_step_details = leg.get("step_details", []) or []
+
+        steps.extend(leg_steps)
         leg_durations_s.append(float(leg.get("duration_s", 0.0)))
         leg_distances_m.append(float(leg.get("distance_m", 0.0)))
         toll_status = toll_status or bool(leg.get("toll_status"))
+
+        for sd in leg_step_details:
+            item = dict(sd)
+            item["route_index"] = int(item.get("route_index", 0)) + point_offset
+            step_details.append(item)
+
+        if leg_idx == 0:
+            point_offset += len(leg_points)
+        else:
+            point_offset += max(0, len(leg_points) - 1)
 
     return {
         "route_id": route_id,
@@ -1299,6 +1380,7 @@ def _build_combined_route_from_legs(
         "path_points": path_points,
         "toll_status": toll_status,
         "steps": steps,
+        "step_details": step_details,
         "leg_durations_s": leg_durations_s,
         "leg_distances_m": leg_distances_m,
         "route_labels": ["COMBINED_MULTILEG"],
@@ -1538,6 +1620,14 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 "soc_drop_pp": best["soc"]["soc_drop_pp"],
             },
             "navigation_steps": best.get("steps", []),
+            "step_details": [
+                {
+                    "instruction": sd.get("instruction", ""),
+                    "distance_m": round(float(sd.get("distance_m", 0.0)), 1),
+                    "route_index": int(sd.get("route_index", 0)),
+                }
+                for sd in best.get("step_details", [])
+            ],
             "route_points": route_points,
             "selected_stops": [stop["name"] for stop in selected_stops],
             "stop_arrivals": best["stop_arrivals"],
@@ -1633,6 +1723,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 "soc_drop_pp": enriched["soc"]["soc_drop_pp"],
             },
             "navigation_steps": fallback_route["steps"],
+            "step_details": [],
             "route_points": fallback_points,
             "selected_stops": [stop["name"] for stop in selected_stops],
             "stop_arrivals": enriched["stop_arrivals"],
