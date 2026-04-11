@@ -1008,6 +1008,45 @@ def _hours_to_mmss(hours_value: float) -> str:
     seconds = total_seconds % 60
     return f"{minutes:02d}:{seconds:02d}"
 
+
+def _confidence_label_from_pct(score_pct: float) -> str:
+    if score_pct >= 85:
+        return "High"
+    if score_pct >= 65:
+        return "Good"
+    if score_pct >= 45:
+        return "Moderate"
+    return "Low"
+
+
+def _eta_confidence_label(traffic_delay_min: float) -> str:
+    if traffic_delay_min <= 0.5:
+        return "High"
+    if traffic_delay_min <= 2.0:
+        return "Good"
+    if traffic_delay_min <= 4.0:
+        return "Moderate"
+    return "Low"
+
+
+def _route_confidence_payload(route: dict) -> dict:
+    closeness = float(route.get("topsis_closeness", 0.0) or 0.0)
+    front_rank = int(route.get("pareto_front_rank", 1) or 1)
+    front_factor = 1.0 / max(front_rank, 1)
+    traffic_delay = float(route.get("sustainability_metrics", {}).get("traffic_delay_min", 0.0) or 0.0)
+    reserve_pct = float(route["soc"].get("effective_reserve_pct", route["soc"].get("reserve_soc_pct", 20.0)))
+    end_soc_pct = float(route["soc"]["end_soc_pct"])
+    soc_margin = max(0.0, end_soc_pct - reserve_pct)
+    margin_factor = min(1.0, soc_margin / 18.0)
+    traffic_factor = max(0.0, 1.0 - min(traffic_delay, 6.0) / 6.0)
+    score_pct = round(100.0 * ((0.50 * closeness) + (0.20 * front_factor) + (0.15 * margin_factor) + (0.15 * traffic_factor)), 1)
+    return {
+        "confidence_score_pct": score_pct,
+        "confidence_label": _confidence_label_from_pct(score_pct),
+        "eta_confidence_label": _eta_confidence_label(traffic_delay),
+    }
+
+
 def _traffic_delay_minutes(route: dict) -> float:
     labels = set(route.get("route_labels", []) or [])
     if "DEFAULT_ROUTE" in labels:
@@ -1035,22 +1074,47 @@ def _build_charge_policy(
     battery = DEFAULT_SHUTTLE["usable_battery_kwh"]
     projected_round_trip_drop_pct = ((float(best_route["energy"]["total_kwh"]) + worst_case_energy) / battery) * 100.0
     projected_round_trip_end_soc_pct = max(0.0, float(start_soc_pct) - projected_round_trip_drop_pct)
+    trip_end_soc_pct = float(best_route["soc"]["end_soc_pct"])
+    remaining_trips = int(best_route["soc"].get("remaining_trips_before_charge", 0) or 0)
+
     charge_required = (
         projected_round_trip_end_soc_pct < UNIVERSITY_CHARGE_LIMIT_SOC_PCT or
-        float(best_route["soc"]["end_soc_pct"]) < UNIVERSITY_CHARGE_LIMIT_SOC_PCT
+        trip_end_soc_pct < UNIVERSITY_CHARGE_LIMIT_SOC_PCT
     )
-    warning = (
-        "Charge at Macquarie University before departure."
-        if charge_required else
-        "Current SOC is acceptable for the selected trip."
+    charge_recommended_soon = (
+        not charge_required and (
+            projected_round_trip_end_soc_pct < (UNIVERSITY_CHARGE_LIMIT_SOC_PCT + 10.0) or
+            trip_end_soc_pct < (UNIVERSITY_CHARGE_LIMIT_SOC_PCT + 8.0) or
+            remaining_trips <= 1
+        )
     )
+
+    if charge_required:
+        status = "critical"
+        status_label = "Charge before departure"
+        banner_message = "Charge at Macquarie University before departure."
+    elif charge_recommended_soon:
+        status = "warning"
+        status_label = "Charge recommended soon"
+        banner_message = "Trip is feasible, but charging at Macquarie University is recommended soon."
+    else:
+        status = "safe"
+        status_label = "Safe to start"
+        banner_message = "Current SOC is acceptable for the selected trip."
+
     return {
+        "status": status,
+        "status_label": status_label,
+        "banner_message": banner_message,
         "charge_limit_soc_pct": round(UNIVERSITY_CHARGE_LIMIT_SOC_PCT, 1),
         "reserve_soc_pct": round(DEFAULT_SHUTTLE["reserve_soc_pct"], 1),
         "charge_required_before_departure": charge_required,
+        "charge_recommended_soon": charge_recommended_soon,
         "can_complete_worst_case_round_trip_from_university": not charge_required,
         "projected_round_trip_end_soc_pct": round(projected_round_trip_end_soc_pct, 1),
-        "departure_warning": warning,
+        "trip_end_soc_pct": round(trip_end_soc_pct, 1),
+        "remaining_trips_before_charge": remaining_trips,
+        "departure_warning": banner_message,
     }
 
 
@@ -1262,7 +1326,7 @@ def _assign_rank_metadata(
             item["recommendation_basis"] = (
                 "Constrained multi-objective ranking using Pareto-front screening "
                 "followed by TOPSIS compromise selection across travel time, "
-                "distance, total energy, SOC reserve compliance and toll exposure"
+                "distance, total energy, SOC reserve compliance, toll exposure and traffic delay"
             )
             ranked.append(item)
 
@@ -1406,6 +1470,9 @@ def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> 
         "score": round(route["score"], 4),
         "pareto_front_rank": route.get("pareto_front_rank"),                
         "topsis_closeness": route.get("topsis_closeness"),
+        "confidence_score_pct": route.get("confidence_score_pct"),
+        "confidence_label": route.get("confidence_label"),
+        "eta_confidence_label": route.get("eta_confidence_label"),
         "recommendation_basis": route.get("recommendation_basis", ""),
         "route_points": [
             {"lat": float(lat), "lng": float(lng)}
@@ -1627,6 +1694,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             r["arrival_time"] = (
                 depart_dt + datetime.timedelta(seconds=float(r["duration_s"]))
             ).strftime("%H:%M")
+            r.update(_route_confidence_payload(r))
 
         
         if (len(ranked_stop_routes) <= 1) and (not fastest_route_only) and selected_stops:
@@ -1663,6 +1731,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                             seconds=float(r["duration_s"])
                         )
                     ).strftime("%H:%M")
+                    r.update(_route_confidence_payload(r))
 
             except Exception:
                 pass
@@ -1737,6 +1806,9 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 "traffic_delay_min": best["sustainability_metrics"].get("traffic_delay_min", 0.0),
                 "traffic_level": best["sustainability_metrics"].get("traffic_level", "Unknown"),
                 "energy_saving_vs_highest_energy_route_pct": round(saving_vs_highest_pct, 1),
+                "confidence_score_pct": best.get("confidence_score_pct"),
+                "confidence_label": best.get("confidence_label"),
+                "eta_confidence_label": best.get("eta_confidence_label"),
             },
             "energy": {
                 **best["energy"],
@@ -1781,6 +1853,9 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             "remaining_trips_before_charge": best["soc"]["remaining_trips_before_charge"],
             "recommended_route": best["route_id"],
             "recommendation_basis": best["recommendation_basis"],
+            "confidence_score_pct": best.get("confidence_score_pct"),
+            "confidence_label": best.get("confidence_label"),
+            "eta_confidence_label": best.get("eta_confidence_label"),
             "charge_policy": charge_policy,
             "sequential_plan": sequential_plan,
             "all_routes": all_routes_payload,
@@ -1833,6 +1908,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
         enriched["arrival_time"] = (depart_dt + datetime.timedelta(seconds=duration_s)).strftime("%H:%M")
 
         queue_risk = "Unknown"
+        enriched.update(_route_confidence_payload(enriched))
         charging_schedule = _charging_schedule_from_soc(enriched["soc"]["end_soc_pct"], 0)
         charge_policy = _build_charge_policy(
             selected_trip=saved_trip,
@@ -1858,6 +1934,9 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 "traffic_delay_min": enriched["sustainability_metrics"].get("traffic_delay_min", 0.0),
                 "traffic_level": enriched["sustainability_metrics"].get("traffic_level", "Unknown"),
                 "energy_saving_vs_highest_energy_route_pct": 0.0,
+                "confidence_score_pct": enriched.get("confidence_score_pct"),
+                "confidence_label": enriched.get("confidence_label"),
+                "eta_confidence_label": enriched.get("eta_confidence_label"),
             },
             "energy": {
                 **enriched["energy"],
@@ -1895,6 +1974,9 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             "remaining_trips_before_charge": enriched["soc"]["remaining_trips_before_charge"],
             "recommended_route": "R1",
             "recommendation_basis": "Fallback route estimate",
+            "confidence_score_pct": enriched.get("confidence_score_pct"),
+            "confidence_label": enriched.get("confidence_label"),
+            "eta_confidence_label": enriched.get("eta_confidence_label"),
             "charge_policy": charge_policy,
             "sequential_plan": sequential_plan,
             "all_routes": [
