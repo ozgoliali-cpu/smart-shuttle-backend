@@ -73,6 +73,15 @@ STOP_START_PER_PASSENGER_KWH = 0.0012
 LOW_SPEED_STOP_GO_THRESHOLD_KMH = 22.0
 HIGHWAY_EFFICIENCY_THRESHOLD_KMH = 58.0
 
+ENERGY_MODEL_CALIBRATION = {
+    "rolling_multiplier": float(_env.get("ROLLING_MULTIPLIER", os.environ.get("ROLLING_MULTIPLIER", 1.00))),
+    "aero_multiplier": float(_env.get("AERO_MULTIPLIER", os.environ.get("AERO_MULTIPLIER", 1.00))),
+    "hvac_multiplier": float(_env.get("HVAC_MULTIPLIER", os.environ.get("HVAC_MULTIPLIER", 1.00))),
+    "stop_start_multiplier": float(_env.get("STOP_START_MULTIPLIER", os.environ.get("STOP_START_MULTIPLIER", 1.00))),
+    "idling_multiplier": float(_env.get("IDLING_MULTIPLIER", os.environ.get("IDLING_MULTIPLIER", 1.00))),
+    "traction_multiplier": float(_env.get("TRACTION_MULTIPLIER", os.environ.get("TRACTION_MULTIPLIER", 1.00))),
+}
+
 
 MU = {
     "name": "Macquarie University",
@@ -942,6 +951,15 @@ def _estimate_stop_start_penalty_kwh(route_row: dict, passengers: int) -> dict:
     }
 
 
+def _calibration_multiplier(name: str) -> float:
+    value = float(ENERGY_MODEL_CALIBRATION.get(name, 1.0) or 1.0)
+    return max(0.70, min(value, 1.35))
+
+
+def _apply_energy_calibration(raw_kwh: float, name: str) -> float:
+    return raw_kwh * _calibration_multiplier(name)
+
+
 def _estimate_speed_traction_kwh(distance_km: float, avg_speed_kmh: float, passengers: int) -> dict:
     speed_kmh = max(avg_speed_kmh, 8.0)
     speed_mps = speed_kmh / 3.6
@@ -953,24 +971,29 @@ def _estimate_speed_traction_kwh(distance_km: float, avg_speed_kmh: float, passe
 
     rolling_force_n = total_mass_kg * 9.81 * ROLLING_RESISTANCE_COEFF
     aero_force_n = 0.5 * AIR_DENSITY_KG_PER_M3 * AERO_DRAG_COEFF_CD * FRONTAL_AREA_M2 * (speed_mps ** 2)
-    total_force_n = rolling_force_n + aero_force_n
-
-    mech_energy_kwh = (total_force_n * (distance_km * 1000.0)) / 3_600_000.0
 
     driveline_eff = 0.89 if speed_kmh <= HIGHWAY_EFFICIENCY_THRESHOLD_KMH else 0.86
-    traction_kwh = mech_energy_kwh / max(driveline_eff, 0.75)
+
+    rolling_kwh_raw = (rolling_force_n * (distance_km * 1000.0)) / 3_600_000.0 / max(driveline_eff, 0.75)
+    aero_kwh_raw = (aero_force_n * (distance_km * 1000.0)) / 3_600_000.0 / max(driveline_eff, 0.75)
+
+    rolling_kwh = _apply_energy_calibration(rolling_kwh_raw, "rolling_multiplier")
+    aero_kwh = _apply_energy_calibration(aero_kwh_raw, "aero_multiplier")
+    traction_kwh = rolling_kwh + aero_kwh
 
     if speed_kmh <= LOW_SPEED_STOP_GO_THRESHOLD_KMH:
         traction_kwh *= 1.08
     elif speed_kmh >= 80.0:
         traction_kwh *= 1.04
 
+    traction_kwh = _apply_energy_calibration(traction_kwh, "traction_multiplier")
+
     baseline_floor = distance_km * DEFAULT_SHUTTLE["kwh_per_km_baseline"] * (1.0 + 0.010 * max(passengers, 0))
     traction_kwh = max(traction_kwh, baseline_floor * 0.82)
 
     return {
-        "rolling_kwh": round((rolling_force_n * (distance_km * 1000.0)) / 3_600_000.0 / max(driveline_eff, 0.75), 3),
-        "aero_kwh": round((aero_force_n * (distance_km * 1000.0)) / 3_600_000.0 / max(driveline_eff, 0.75), 3),
+        "rolling_kwh": round(rolling_kwh, 3),
+        "aero_kwh": round(aero_kwh, 3),
         "traction_kwh": round(traction_kwh, 3),
         "speed_kmh_used": round(speed_kmh, 1),
     }
@@ -1006,7 +1029,7 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
     slope_net_kwh = max(slope_net_kwh, -max_downhill_credit_kwh)
 
     stop_start_adj = _estimate_stop_start_penalty_kwh(route_row, passengers)
-    stop_start_kwh = float(stop_start_adj["kwh"])
+    stop_start_kwh = _apply_energy_calibration(float(stop_start_adj["kwh"]), "stop_start_multiplier")
 
     traction_kwh = max(0.0, traction_base_kwh + slope_net_kwh + stop_start_kwh)
 
@@ -1022,7 +1045,8 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
         mid_lat, mid_lng = _route_midpoint_lat_lng(route_row)
         outdoor_temp_c = _fetch_outdoor_temp_c(mid_lat, mid_lng, depart_dt)
         hvac_kw = _estimate_hvac_power_kw(outdoor_temp_c, passengers)
-        hvac_kwh = hvac_kw * duration_h
+        hvac_kwh = _apply_energy_calibration(hvac_kw * duration_h, "hvac_multiplier")
+        hvac_kw = hvac_kwh / duration_h if duration_h > 0 else hvac_kw
     else:
         month = depart_dt.month
         if month in [12, 1, 2]:
@@ -1032,11 +1056,11 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
         else:
             hvac_factor = 1.05
 
-        hvac_kwh = max(0.0, (hvac_factor - 1.0) * traction_base_kwh)
+        hvac_kwh = _apply_energy_calibration(max(0.0, (hvac_factor - 1.0) * traction_base_kwh), "hvac_multiplier")
         hvac_kw = hvac_kwh / duration_h if duration_h > 0 else 0.0
 
     idling_adj = _estimate_idling_energy_kwh(route_row, hvac_kw)
-    idling_kwh = float(idling_adj["idle_kwh"])
+    idling_kwh = _apply_energy_calibration(float(idling_adj["idle_kwh"]), "idling_multiplier")
 
     onboard_kw = DEFAULT_SHUTTLE["onboard_systems_kw"]
     device_kw = (
@@ -1274,6 +1298,55 @@ def _build_sequential_plan(
     }
 
 
+def _adaptive_route_weights(routes: List[dict], current_soc_pct: float | None = None) -> tuple[Dict[str, float], str]:
+    weights = {
+        "travel_time_min": 0.24,
+        "distance_km": 0.10,
+        "total_kwh": 0.28,
+        "soc_deficit_pct": 0.12,
+        "toll_penalty": 0.08,
+        "traffic_delay_min": 0.10,
+        "charge_risk_penalty": 0.08,
+    }
+
+    if not routes:
+        return weights, "Balanced multi-objective ranking"
+
+    avg_traffic_delay = sum(_traffic_delay_minutes(r) for r in routes) / len(routes)
+    min_end_soc = min(float(r["soc"]["end_soc_pct"]) for r in routes)
+    current_soc = float(current_soc_pct) if current_soc_pct is not None else float(routes[0]["soc"]["start_soc_pct"])
+
+    notes = ["Balanced multi-objective ranking"]
+
+    if current_soc <= 35.0 or min_end_soc <= (UNIVERSITY_CHARGE_LIMIT_SOC_PCT + 8.0):
+        weights.update({
+            "travel_time_min": 0.18,
+            "distance_km": 0.08,
+            "total_kwh": 0.32,
+            "soc_deficit_pct": 0.14,
+            "toll_penalty": 0.06,
+            "traffic_delay_min": 0.08,
+            "charge_risk_penalty": 0.14,
+        })
+        notes.append("SOC-protective weighting active")
+
+    elif avg_traffic_delay >= 1.5:
+        weights.update({
+            "travel_time_min": 0.28,
+            "distance_km": 0.09,
+            "total_kwh": 0.24,
+            "soc_deficit_pct": 0.11,
+            "toll_penalty": 0.07,
+            "traffic_delay_min": 0.15,
+            "charge_risk_penalty": 0.06,
+        })
+        notes.append("Traffic-responsive weighting active")
+
+    total = sum(weights.values())
+    weights = {k: v / total for k, v in weights.items()}
+    return weights, "; ".join(notes)
+
+
 def _route_cost_vector(route: dict) -> Dict[str, float]:
     travel_time_min = float(route["duration_s"]) / 60.0
     distance_km = float(route["distance_m"]) / 1000.0
@@ -1381,6 +1454,8 @@ def _topsis_closeness(routes: List[dict], weights: Dict[str, float]) -> Dict[int
 def _assign_rank_metadata(
     fronts: List[List[dict]],
     fastest_route_only: bool,
+    weights: Dict[str, float] | None = None,
+    recommendation_basis: str | None = None,
 ) -> List[dict]:
     ranked: List[dict] = []
 
@@ -1398,11 +1473,11 @@ def _assign_rank_metadata(
                 1.0 if len(ordered) == 1 else max(0.30, 1.0 - 0.70 * ((pos - 1) / (len(ordered) - 1))),
                 3,
             )
-            item["recommendation_basis"] = "Fastest feasible route selection"
+            item["recommendation_basis"] = recommendation_basis or "Fastest feasible route selection"
             ranked.append(item)
         return ranked
 
-    weights = {
+    weights = weights or {
         "travel_time_min": 0.24,
         "distance_km": 0.10,
         "total_kwh": 0.28,
@@ -1430,7 +1505,7 @@ def _assign_rank_metadata(
             sustainability_index = 0.20 + 0.80 * ((0.65 * c) + (0.35 * front_factor))
             item["route_sustainability_index"] = round(min(1.0, max(0.20, sustainability_index)), 3)
 
-            item["recommendation_basis"] = (
+            item["recommendation_basis"] = recommendation_basis or (
                 "Constrained multi-objective ranking using Pareto-front screening "
                 "followed by TOPSIS compromise selection across travel time, "
                 "distance, total energy, SOC reserve compliance, toll exposure and traffic delay"
@@ -1439,7 +1514,11 @@ def _assign_rank_metadata(
 
     return ranked
 
-def _rank_routes_balanced(routes: List[dict], fastest_route_only: bool) -> List[dict]:
+def _rank_routes_balanced(
+    routes: List[dict],
+    fastest_route_only: bool,
+    current_soc_pct: float | None = None,
+) -> List[dict]:
     if not routes:
         return []
 
@@ -1448,10 +1527,29 @@ def _rank_routes_balanced(routes: List[dict], fastest_route_only: bool) -> List[
 
     if fastest_route_only:
         ordered = sorted(working_routes, key=lambda r: float(r["duration_s"]))
-        return _assign_rank_metadata([ordered], fastest_route_only=True)
+        return _assign_rank_metadata(
+            [ordered],
+            fastest_route_only=True,
+            recommendation_basis="Fastest feasible route selection",
+        )
+
+    adaptive_weights, recommendation_basis = _adaptive_route_weights(
+        working_routes,
+        current_soc_pct=current_soc_pct,
+    )
 
     fronts = _non_dominated_fronts(working_routes)
-    ranked = _assign_rank_metadata(fronts, fastest_route_only=False)
+    ranked = _assign_rank_metadata(
+        fronts,
+        fastest_route_only=False,
+        weights=adaptive_weights,
+        recommendation_basis=(
+            "Constrained multi-objective ranking using Pareto-front screening "
+            "followed by adaptive TOPSIS compromise selection across travel time, "
+            "distance, total energy, SOC reserve compliance, toll exposure and traffic delay. "
+            f"{recommendation_basis}"
+        ),
+    )
     ranked.sort(key=lambda x: (x["pareto_front_rank"], x["score"]))
 
     return ranked
@@ -1836,6 +1934,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 ranked_stop_routes = _rank_routes_balanced(
                     enriched_combined_routes,
                     fastest_route_only=False,
+                    current_soc_pct=current_soc_pct,
                 )
 
                 for idx, r in enumerate(ranked_stop_routes, start=1):
@@ -1923,6 +2022,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 "confidence_score_pct": best.get("confidence_score_pct"),
                 "confidence_label": best.get("confidence_label"),
                 "eta_confidence_label": best.get("eta_confidence_label"),
+                "ranking_basis": best.get("recommendation_basis"),
             },
             "energy": {
                 **best["energy"],
@@ -1967,6 +2067,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             "remaining_trips_before_charge": best["soc"]["remaining_trips_before_charge"],
             "recommended_route": best["route_id"],
             "recommendation_basis": best["recommendation_basis"],
+            "energy_model_calibration": ENERGY_MODEL_CALIBRATION,
             "confidence_score_pct": best.get("confidence_score_pct"),
             "confidence_label": best.get("confidence_label"),
             "eta_confidence_label": best.get("eta_confidence_label"),
@@ -2089,6 +2190,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             "remaining_trips_before_charge": enriched["soc"]["remaining_trips_before_charge"],
             "recommended_route": "R1",
             "recommendation_basis": "Fallback route estimate",
+            "energy_model_calibration": ENERGY_MODEL_CALIBRATION,
             "confidence_score_pct": enriched.get("confidence_score_pct"),
             "confidence_label": enriched.get("confidence_label"),
             "eta_confidence_label": enriched.get("eta_confidence_label"),
