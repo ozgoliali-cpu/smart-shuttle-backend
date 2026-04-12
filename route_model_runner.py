@@ -63,6 +63,15 @@ DEFAULT_SHUTTLE = {
 
 SOC_BUFFER_PP = 0.5
 UNIVERSITY_CHARGE_LIMIT_SOC_PCT = 25.0
+AERO_DRAG_COEFF_CD = 0.68
+FRONTAL_AREA_M2 = 7.6
+AIR_DENSITY_KG_PER_M3 = 1.225
+ROLLING_RESISTANCE_COEFF = 0.0105
+IDLE_HVAC_BUFFER_KW = 0.35
+STOP_START_BASE_KWH = 0.012
+STOP_START_PER_PASSENGER_KWH = 0.0012
+LOW_SPEED_STOP_GO_THRESHOLD_KMH = 22.0
+HIGHWAY_EFFICIENCY_THRESHOLD_KMH = 58.0
 
 
 MU = {
@@ -894,14 +903,101 @@ def _estimate_slope_energy_adjustment_kwh(
         "elevation_api_used": True,
     }
 
+def _estimate_stop_start_penalty_kwh(route_row: dict, passengers: int) -> dict:
+    step_details = route_row.get("step_details", []) or []
+    steps = route_row.get("steps", []) or []
+
+    reference_steps = step_details if step_details else [{"instruction": s} for s in steps]
+    stop_like_steps = 0
+
+    for step in reference_steps:
+        instruction = str(step.get("instruction", "")).lower()
+        if any(
+            token in instruction
+            for token in [
+                "turn left",
+                "turn right",
+                "u-turn",
+                "roundabout",
+                "keep left",
+                "keep right",
+                "slight left",
+                "slight right",
+                "ramp",
+                "exit",
+                "merge",
+            ]
+        ):
+            stop_like_steps += 1
+
+    stop_like_steps += max(0, len(route_row.get("stop_indices", []) or []))
+
+    base_events = max(1, min(stop_like_steps, 14))
+    event_kwh = STOP_START_BASE_KWH + (STOP_START_PER_PASSENGER_KWH * max(passengers, 0))
+    total_penalty = base_events * event_kwh
+
+    return {
+        "events": int(base_events),
+        "kwh": round(total_penalty, 3),
+    }
+
+
+def _estimate_speed_traction_kwh(distance_km: float, avg_speed_kmh: float, passengers: int) -> dict:
+    speed_kmh = max(avg_speed_kmh, 8.0)
+    speed_mps = speed_kmh / 3.6
+
+    total_mass_kg = (
+        DEFAULT_SHUTTLE["vehicle_mass_kg"]
+        + max(passengers, 0) * DEFAULT_SHUTTLE["avg_passenger_mass_kg"]
+    )
+
+    rolling_force_n = total_mass_kg * 9.81 * ROLLING_RESISTANCE_COEFF
+    aero_force_n = 0.5 * AIR_DENSITY_KG_PER_M3 * AERO_DRAG_COEFF_CD * FRONTAL_AREA_M2 * (speed_mps ** 2)
+    total_force_n = rolling_force_n + aero_force_n
+
+    mech_energy_kwh = (total_force_n * (distance_km * 1000.0)) / 3_600_000.0
+
+    driveline_eff = 0.89 if speed_kmh <= HIGHWAY_EFFICIENCY_THRESHOLD_KMH else 0.86
+    traction_kwh = mech_energy_kwh / max(driveline_eff, 0.75)
+
+    if speed_kmh <= LOW_SPEED_STOP_GO_THRESHOLD_KMH:
+        traction_kwh *= 1.08
+    elif speed_kmh >= 80.0:
+        traction_kwh *= 1.04
+
+    baseline_floor = distance_km * DEFAULT_SHUTTLE["kwh_per_km_baseline"] * (1.0 + 0.010 * max(passengers, 0))
+    traction_kwh = max(traction_kwh, baseline_floor * 0.82)
+
+    return {
+        "rolling_kwh": round((rolling_force_n * (distance_km * 1000.0)) / 3_600_000.0 / max(driveline_eff, 0.75), 3),
+        "aero_kwh": round((aero_force_n * (distance_km * 1000.0)) / 3_600_000.0 / max(driveline_eff, 0.75), 3),
+        "traction_kwh": round(traction_kwh, 3),
+        "speed_kmh_used": round(speed_kmh, 1),
+    }
+
+
+def _estimate_idling_energy_kwh(route_row: dict, hvac_kw: float) -> dict:
+    traffic_delay_min = _traffic_delay_minutes(route_row)
+    idle_kw = hvac_kw + DEFAULT_SHUTTLE["onboard_systems_kw"] + IDLE_HVAC_BUFFER_KW
+    idle_kwh = idle_kw * (traffic_delay_min / 60.0)
+    return {
+        "traffic_delay_min": round(traffic_delay_min, 2),
+        "idle_kwh": round(idle_kwh, 3),
+    }
+
+
 def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime.datetime) -> dict:
     distance_km = float(route_row["distance_m"]) / 1000.0
     duration_h = float(route_row["duration_s"]) / 3600.0
+    avg_speed_kmh = distance_km / duration_h if duration_h > 0 else 0.0
 
-    base_kwh_per_km = DEFAULT_SHUTTLE["kwh_per_km_baseline"]
-    passenger_factor = 1.0 + 0.015 * passengers
+    speed_based = _estimate_speed_traction_kwh(
+        distance_km=distance_km,
+        avg_speed_kmh=avg_speed_kmh,
+        passengers=passengers,
+    )
 
-    traction_base_kwh = distance_km * base_kwh_per_km * passenger_factor
+    traction_base_kwh = float(speed_based["traction_kwh"])
 
     slope_adj = _estimate_slope_energy_adjustment_kwh(route_row, passengers)
     slope_net_kwh = float(slope_adj["net_kwh"])
@@ -909,7 +1005,10 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
     max_downhill_credit_kwh = 0.35 * traction_base_kwh
     slope_net_kwh = max(slope_net_kwh, -max_downhill_credit_kwh)
 
-    traction_kwh = max(0.0, traction_base_kwh + slope_net_kwh)
+    stop_start_adj = _estimate_stop_start_penalty_kwh(route_row, passengers)
+    stop_start_kwh = float(stop_start_adj["kwh"])
+
+    traction_kwh = max(0.0, traction_base_kwh + slope_net_kwh + stop_start_kwh)
 
     outdoor_temp_c = None
     hvac_kw = 0.0
@@ -936,6 +1035,9 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
         hvac_kwh = max(0.0, (hvac_factor - 1.0) * traction_base_kwh)
         hvac_kw = hvac_kwh / duration_h if duration_h > 0 else 0.0
 
+    idling_adj = _estimate_idling_energy_kwh(route_row, hvac_kw)
+    idling_kwh = float(idling_adj["idle_kwh"])
+
     onboard_kw = DEFAULT_SHUTTLE["onboard_systems_kw"]
     device_kw = (
         DEFAULT_SHUTTLE["device_charging_kw_per_device"]
@@ -944,16 +1046,19 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
 
     onboard_kwh = onboard_kw * duration_h
     device_kwh = device_kw * duration_h
-    auxiliary_kwh = onboard_kwh + device_kwh + hvac_kwh
+    auxiliary_kwh = onboard_kwh + device_kwh + hvac_kwh + idling_kwh
     total_kwh = traction_kwh + auxiliary_kwh
 
     avg_trip_power_kw = total_kwh / duration_h if duration_h > 0 else 0.0
-    avg_speed_kmh = distance_km / duration_h if duration_h > 0 else 0.0
 
     return {
         "total_kwh": round(total_kwh, 2),
         "traction_kwh": round(traction_kwh, 2),
         "traction_base_kwh": round(traction_base_kwh, 2),
+        "rolling_kwh": round(float(speed_based["rolling_kwh"]), 2),
+        "aero_kwh": round(float(speed_based["aero_kwh"]), 2),
+        "stop_start_kwh": round(stop_start_kwh, 2),
+        "stop_start_events": int(stop_start_adj["events"]),
         "slope_uphill_kwh": round(float(slope_adj["uphill_kwh"]), 2),
         "slope_regen_kwh": round(float(slope_adj["regen_kwh"]), 2),
         "slope_net_kwh": round(float(slope_net_kwh), 2),
@@ -962,10 +1067,12 @@ def route_energy_breakdown(route_row: dict, passengers: int, depart_dt: datetime
         "onboard_kwh": round(onboard_kwh, 2),
         "device_kwh": round(device_kwh, 2),
         "hvac_kwh": round(hvac_kwh, 2),
+        "idling_kwh": round(idling_kwh, 2),
+        "traffic_delay_min": round(float(idling_adj["traffic_delay_min"]), 2),
         "hvac_kw_est": round(hvac_kw, 2),
         "outdoor_temp_c": round(outdoor_temp_c, 1) if outdoor_temp_c is not None else None,
         "avg_trip_power_kw": round(avg_trip_power_kw, 2),
-        "avg_speed_kmh": round(avg_speed_kmh, 1),
+        "avg_speed_kmh": round(float(speed_based["speed_kmh_used"]), 1),
     }
 
 
@@ -1443,11 +1550,16 @@ def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> 
         "onboard_kwh": route["energy"]["onboard_kwh"],
         "device_kwh": route["energy"]["device_kwh"],
         "traction_base_kwh": route["energy"]["traction_base_kwh"],
+        "rolling_kwh": route["energy"].get("rolling_kwh"),
+        "aero_kwh": route["energy"].get("aero_kwh"),
+        "stop_start_kwh": route["energy"].get("stop_start_kwh"),
+        "stop_start_events": route["energy"].get("stop_start_events"),
         "slope_uphill_kwh": route["energy"]["slope_uphill_kwh"],
         "slope_regen_kwh": route["energy"]["slope_regen_kwh"],
         "slope_net_kwh": route["energy"]["slope_net_kwh"],
         "elevation_api_used": route["energy"]["elevation_api_used"],
         "hvac_kwh": route["energy"]["hvac_kwh"],
+        "idling_kwh": route["energy"].get("idling_kwh"),
         "hvac_kw_est": route["energy"]["hvac_kw_est"],
         "outdoor_temp_c": route["energy"]["outdoor_temp_c"],
         "avg_trip_power_kw": route["energy"]["avg_trip_power_kw"],
@@ -1681,6 +1793,8 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 passengers=passengers,
                 depart_dt=depart_dt,
                 selected_stops=selected_stops,
+                current_soc_pct=request_data.get("current_soc_pct"),
+                saved_trip=saved_trip,
             )
             for r in stop_routes_raw
         ]
@@ -1895,6 +2009,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             "toll_status": None,
             "leg_durations_s": [duration_s / max(len(selected_stops) + 1, 1)] * max(len(selected_stops) + 1, 1),
             "leg_distances_m": [total_distance_km * 1000.0 / max(len(selected_stops) + 1, 1)] * max(len(selected_stops) + 1, 1),
+            "step_details": [],
         }
 
         enriched = _enrich_route_metrics(
