@@ -1900,6 +1900,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
         ranked_stop_routes = _rank_routes_balanced(
             enriched_stop_routes,
             fastest_route_only=fastest_route_only,
+            current_soc_pct=request_data.get("current_soc_pct"),
         )
 
         for r in ranked_stop_routes:
