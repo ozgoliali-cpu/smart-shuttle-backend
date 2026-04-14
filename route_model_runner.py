@@ -2122,12 +2122,12 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             saved_trip=saved_trip,
         )
         enriched["arrival_time"] = (depart_dt + datetime.timedelta(seconds=duration_s)).strftime("%H:%M")
-enriched["route_sustainability_index"] = 0.75
-
 
         queue_risk = "Unknown"
         enriched.update(_route_confidence_payload(enriched))
-	enriched["route_sustainability_index"] = 0.75
+        enriched["route_sustainability_index"] = 0.75
+        enriched["score"] = 0.0
+        enriched["recommendation_basis"] = "Fallback route estimate"
         charging_schedule = _charging_schedule_from_soc(enriched["soc"]["end_soc_pct"], 0)
         charge_policy = _build_charge_policy(
             selected_trip=saved_trip,
@@ -2149,7 +2149,7 @@ enriched["route_sustainability_index"] = 0.75
                 "distance_km": round(total_distance_km, 2),
                 "arrival_time": arrival_dt.strftime("%H:%M"),
                 "tolls": "Unknown",
-"sustainability_score": 0.75,
+                "sustainability_score": 0.75,
                 "traffic_delay_min": enriched["sustainability_metrics"].get("traffic_delay_min", 0.0),
                 "traffic_level": enriched["sustainability_metrics"].get("traffic_level", "Unknown"),
                 "energy_saving_vs_highest_energy_route_pct": 0.0,
