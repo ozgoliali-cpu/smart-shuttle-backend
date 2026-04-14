@@ -2122,6 +2122,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             saved_trip=saved_trip,
         )
         enriched["arrival_time"] = (depart_dt + datetime.timedelta(seconds=duration_s)).strftime("%H:%M")
+	enriched["route_sustainability_index"] = 0.75
 
         queue_risk = "Unknown"
         enriched.update(_route_confidence_payload(enriched))
