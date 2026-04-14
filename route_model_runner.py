@@ -1934,7 +1934,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 ranked_stop_routes = _rank_routes_balanced(
                     enriched_combined_routes,
                     fastest_route_only=False,
-                    current_soc_pct=current_soc_pct,
+                    current_soc_pct=request_data.get("current_soc_pct"),
                 )
 
                 for idx, r in enumerate(ranked_stop_routes, start=1):
@@ -2122,7 +2122,8 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             saved_trip=saved_trip,
         )
         enriched["arrival_time"] = (depart_dt + datetime.timedelta(seconds=duration_s)).strftime("%H:%M")
-	enriched["route_sustainability_index"] = 0.75
+enriched["route_sustainability_index"] = 0.75
+
 
         queue_risk = "Unknown"
         enriched.update(_route_confidence_payload(enriched))
