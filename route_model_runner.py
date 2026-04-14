@@ -1934,7 +1934,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 ranked_stop_routes = _rank_routes_balanced(
                     enriched_combined_routes,
                     fastest_route_only=False,
-                    current_soc_pct=current_soc_pct,
+                    current_soc_pct=request_data.get("current_soc_pct"),
                 )
 
                 for idx, r in enumerate(ranked_stop_routes, start=1):
@@ -2125,6 +2125,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
 
         queue_risk = "Unknown"
         enriched.update(_route_confidence_payload(enriched))
+        enriched["route_sustainability_index"] = 0.75
         charging_schedule = _charging_schedule_from_soc(enriched["soc"]["end_soc_pct"], 0)
         charge_policy = _build_charge_policy(
             selected_trip=saved_trip,
