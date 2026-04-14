@@ -1535,7 +1535,7 @@ def _rank_routes_balanced(
 
     adaptive_weights, recommendation_basis = _adaptive_route_weights(
         working_routes,
-        current_soc_pct=current_soc_pct,
+        current_soc_pct=request_data.get("current_soc_pct"),
     )
 
     fronts = _non_dominated_fronts(working_routes)
@@ -1934,7 +1934,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 ranked_stop_routes = _rank_routes_balanced(
                     enriched_combined_routes,
                     fastest_route_only=False,
-                    current_soc_pct=request_data.get("current_soc_pct"),
+                    current_soc_pct=current_soc_pct,
                 )
 
                 for idx, r in enumerate(ranked_stop_routes, start=1):
@@ -2125,11 +2125,6 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
 
         queue_risk = "Unknown"
         enriched.update(_route_confidence_payload(enriched))
-        enriched["route_sustainability_index"] = 0.75
-        enriched["score"] = 0.0
-        enriched["pareto_front_rank"] = 1
-        enriched["topsis_closeness"] = 1.0
-        enriched["recommendation_basis"] = "Fallback route estimate"
         charging_schedule = _charging_schedule_from_soc(enriched["soc"]["end_soc_pct"], 0)
         charge_policy = _build_charge_policy(
             selected_trip=saved_trip,
