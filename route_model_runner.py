@@ -1535,7 +1535,7 @@ def _rank_routes_balanced(
 
     adaptive_weights, recommendation_basis = _adaptive_route_weights(
         working_routes,
-        current_soc_pct=current_soc_pct,
+        current_soc_pct=request_data.get("current_soc_pct"),
     )
 
     fronts = _non_dominated_fronts(working_routes)
