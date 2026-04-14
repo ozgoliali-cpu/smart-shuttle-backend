@@ -2148,7 +2148,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 "distance_km": round(total_distance_km, 2),
                 "arrival_time": arrival_dt.strftime("%H:%M"),
                 "tolls": "Unknown",
-                "sustainability_score": 0.75,
+"sustainability_score": 0.75,
                 "traffic_delay_min": enriched["sustainability_metrics"].get("traffic_delay_min", 0.0),
                 "traffic_level": enriched["sustainability_metrics"].get("traffic_level", "Unknown"),
                 "energy_saving_vs_highest_energy_route_pct": 0.0,
