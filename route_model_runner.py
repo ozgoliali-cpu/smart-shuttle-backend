@@ -1676,7 +1676,7 @@ def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> 
         "tolls": "Toll applies" if route.get("toll_status") else "No toll",
         "traffic_delay_min": route["sustainability_metrics"].get("traffic_delay_min", 0.0),
         "traffic_level": route["sustainability_metrics"].get("traffic_level", "Unknown"),
-        "route_sustainability_index": route.get("route_sustainability_index", route.get("sustainability_score", 0.75)),
+        "route_sustainability_index": route["route_sustainability_index"],
         "score": round(route["score"], 4),
         "pareto_front_rank": route.get("pareto_front_rank"),                
         "topsis_closeness": route.get("topsis_closeness"),
@@ -1907,7 +1907,6 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 depart_dt + datetime.timedelta(seconds=float(r["duration_s"]))
             ).strftime("%H:%M")
             r.update(_route_confidence_payload(r))
-            r.setdefault("route_sustainability_index", r.get("sustainability_score", 0.75))
 
         
         if (len(ranked_stop_routes) <= 1) and (not fastest_route_only) and selected_stops:
@@ -1935,7 +1934,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 ranked_stop_routes = _rank_routes_balanced(
                     enriched_combined_routes,
                     fastest_route_only=False,
-                    current_soc_pct=request_data.get("current_soc_pct"),
+                    current_soc_pct=current_soc_pct,
                 )
 
                 for idx, r in enumerate(ranked_stop_routes, start=1):
@@ -1946,7 +1945,6 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                         )
                     ).strftime("%H:%M")
                     r.update(_route_confidence_payload(r))
-                    r.setdefault("route_sustainability_index", r.get("sustainability_score", 0.75))
 
             except Exception:
                 pass
@@ -2015,7 +2013,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 "distance_km": round(distance_km, 2),
                 "arrival_time": selected_arrival_dt.strftime("%H:%M"),
                 "tolls": "Toll applies" if best.get("toll_status") else "No toll",
-                "sustainability_score": best.get("route_sustainability_index", best.get("sustainability_score", 0.75)),
+                "sustainability_score": best["route_sustainability_index"],
                 "pareto_front_rank": best.get("pareto_front_rank"),
                 "topsis_closeness": best.get("topsis_closeness"),
                 "traffic_delay_min": best["sustainability_metrics"].get("traffic_delay_min", 0.0),
@@ -2064,7 +2062,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             "chargers": chargers,
             "queue_risk": queue_risk,
             "suggested_charging_schedule": charging_schedule,
-            "route_sustainability_index": best.get("route_sustainability_index", best.get("sustainability_score", 0.75)),
+            "route_sustainability_index": best["route_sustainability_index"],
             "avg_speed_kmh": best["sustainability_metrics"]["avg_speed_kmh"],
             "remaining_trips_before_charge": best["soc"]["remaining_trips_before_charge"],
             "recommended_route": best["route_id"],
@@ -2127,7 +2125,6 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
 
         queue_risk = "Unknown"
         enriched.update(_route_confidence_payload(enriched))
-        enriched["route_sustainability_index"] = 0.75
         charging_schedule = _charging_schedule_from_soc(enriched["soc"]["end_soc_pct"], 0)
         charge_policy = _build_charge_policy(
             selected_trip=saved_trip,
