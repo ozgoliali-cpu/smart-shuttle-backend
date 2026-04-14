@@ -2126,6 +2126,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
 
         queue_risk = "Unknown"
         enriched.update(_route_confidence_payload(enriched))
+	enriched["route_sustainability_index"] = 0.75
         charging_schedule = _charging_schedule_from_soc(enriched["soc"]["end_soc_pct"], 0)
         charge_policy = _build_charge_policy(
             selected_trip=saved_trip,
