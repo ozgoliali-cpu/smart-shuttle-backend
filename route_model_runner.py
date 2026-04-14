@@ -1676,8 +1676,8 @@ def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> 
         "tolls": "Toll applies" if route.get("toll_status") else "No toll",
         "traffic_delay_min": route["sustainability_metrics"].get("traffic_delay_min", 0.0),
         "traffic_level": route["sustainability_metrics"].get("traffic_level", "Unknown"),
-        "route_sustainability_index": route.get("route_sustainability_index", 0.75),
-        "score": round(float(route.get("score", 0.0)), 4),
+        "route_sustainability_index": route["route_sustainability_index"],
+        "score": round(route["score"], 4),
         "pareto_front_rank": route.get("pareto_front_rank"),                
         "topsis_closeness": route.get("topsis_closeness"),
         "confidence_score_pct": route.get("confidence_score_pct"),
@@ -1934,7 +1934,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 ranked_stop_routes = _rank_routes_balanced(
                     enriched_combined_routes,
                     fastest_route_only=False,
-                    current_soc_pct=current_soc_pct,
+                    current_soc_pct=request_data.get("current_soc_pct"),
                 )
 
                 for idx, r in enumerate(ranked_stop_routes, start=1):
