@@ -215,55 +215,68 @@ def _fallback_route_points(origin: dict, destination: dict, stops: List[dict]) -
     return points
 
 
-
 def _polyline_length_m(points: List[Tuple[float, float]]) -> float:
     if len(points) < 2:
         return 0.0
     total = 0.0
     for i in range(len(points) - 1):
-        total += _haversine_m(
-            float(points[i][0]),
-            float(points[i][1]),
-            float(points[i + 1][0]),
-            float(points[i + 1][1]),
-        )
+        total += _haversine_m(points[i][0], points[i][1], points[i + 1][0], points[i + 1][1])
     return total
 
 
-def _is_usable_road_polyline(
-    points: List[Tuple[float, float]],
-    expected_distance_m: float | None = None,
-) -> bool:
-    """Reject obvious waypoint-only/fallback straight-line geometry.
+def _dedupe_consecutive_points(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
+    out: List[Tuple[float, float]] = []
+    for lat, lng in points or []:
+        item = (float(lat), float(lng))
+        if not out or _haversine_m(out[-1][0], out[-1][1], item[0], item[1]) > 1.0:
+            out.append(item)
+    return out
 
-    A real Google road polyline for this app should normally contain many
-    points. Two or three points almost always means the backend fallback has
-    been used, which creates a straight line between origin/stops/destination.
-    """
-    if not points or len(points) < 8:
+
+def _extract_path_from_step_details(step_details: List[dict]) -> List[Tuple[float, float]]:
+    points: List[Tuple[float, float]] = []
+    for step in step_details or []:
+        for p in (step.get("poly_points") or []):
+            if isinstance(p, (list, tuple)) and len(p) >= 2:
+                try:
+                    points.append((float(p[0]), float(p[1])))
+                except Exception:
+                    continue
+    return _dedupe_consecutive_points(points)
+
+
+def _is_usable_road_polyline(points: List[Tuple[float, float]], distance_m: float | None = None) -> bool:
+    points = _dedupe_consecutive_points(points or [])
+    if len(points) < 8:
         return False
-
     length_m = _polyline_length_m(points)
-    if length_m <= 250.0:
+    if length_m < 250.0:
         return False
-
-    if expected_distance_m and expected_distance_m > 0:
-        # If the drawn polyline is far shorter than the route distance, it is
-        # almost certainly not a valid road geometry.
-        if length_m < 0.55 * float(expected_distance_m):
-            return False
-
+    if distance_m and distance_m > 1000.0 and length_m < (0.55 * float(distance_m)):
+        return False
     return True
 
 
-def _routes_have_usable_road_polyline(routes: List[dict]) -> bool:
-    for route in routes or []:
-        if _is_usable_road_polyline(
-            route.get("path_points", []) or [],
-            expected_distance_m=float(route.get("distance_m", 0.0) or 0.0),
-        ):
-            return True
-    return False
+def _ensure_road_path_points(route_row: dict) -> dict:
+    item = dict(route_row)
+    distance_m = float(item.get("distance_m", 0.0) or 0.0)
+    path_points = _dedupe_consecutive_points(item.get("path_points", []) or [])
+
+    if _is_usable_road_polyline(path_points, distance_m):
+        item["path_points"] = path_points
+        item["geometry_source"] = "route_polyline"
+        return item
+
+    step_path = _extract_path_from_step_details(item.get("step_details", []) or [])
+    if _is_usable_road_polyline(step_path, distance_m):
+        item["path_points"] = step_path
+        item["step_details"] = _estimate_step_route_indices(step_path, item.get("step_details", []) or [])
+        item["geometry_source"] = "step_polylines"
+        return item
+
+    item["path_points"] = path_points
+    item["geometry_source"] = "sparse_or_fallback"
+    return item
 
 
 def _haversine_m(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
@@ -642,197 +655,21 @@ def _compute_route_google(
         toll_status = ((route.get("travelAdvisory") or {}).get("tollInfo")) is not None
         route_labels = route.get("routeLabels", []) or []
 
-        results.append(
-            {
-                "route_id": f"R{idx}",
-                "duration_s": duration_s,
-                "distance_m": distance_m,
-                "path_points": path_points,
-                "toll_status": toll_status,
-                "steps": steps,
-                "step_details": step_details,
-                "leg_durations_s": leg_durations_s,
-                "leg_distances_m": leg_distances_m,
-                "route_labels": route_labels,
-            }
-        )
-
-    return results
-
-
-def _compute_route_google_basic(
-    origin: dict,
-    destination: dict,
-    selected_stops: List[dict],
-    depart_dt: datetime.datetime,
-    avoid_tolls: bool,
-    fastest_route_only: bool,
-    allow_alternatives: bool,
-) -> List[dict]:
-    """Simplified retry path used when the main Google Routes request fails
-    or returns sparse geometry. It removes toll extra computations and uses a
-    narrower field mask so the app still receives a proper road polyline.
-    """
-    if not GOOGLE_API_KEY:
-        raise RuntimeError("No Google API key found in text.env or environment variables.")
-
-    body = {
-        "origin": {
-            "location": {
-                "latLng": {
-                    "latitude": float(origin["lat"]),
-                    "longitude": float(origin["lng"]),
-                }
-            }
-        },
-        "destination": {
-            "location": {
-                "latLng": {
-                    "latitude": float(destination["lat"]),
-                    "longitude": float(destination["lng"]),
-                }
-            }
-        },
-        "travelMode": "DRIVE",
-        "routingPreference": "TRAFFIC_AWARE",
-        "computeAlternativeRoutes": allow_alternatives and (not fastest_route_only),
-        "departureTime": depart_dt.isoformat(),
-        "languageCode": "en-AU",
-        "units": "METRIC",
-        "polylineEncoding": "ENCODED_POLYLINE",
-        "polylineQuality": "HIGH_QUALITY",
-    }
-
-    if selected_stops:
-        body["intermediates"] = _build_waypoints(selected_stops)
-
-    if avoid_tolls:
-        body["routeModifiers"] = {
-            "avoidTolls": True,
-            "avoidHighways": False,
-            "avoidFerries": False,
-        }
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": GOOGLE_API_KEY,
-        "X-Goog-FieldMask": (
-            "routes.routeLabels,"
-            "routes.duration,"
-            "routes.distanceMeters,"
-            "routes.polyline.encodedPolyline,"
-            "routes.legs.duration,"
-            "routes.legs.distanceMeters,"
-            "routes.legs.steps.distanceMeters,"
-            "routes.legs.steps.polyline.encodedPolyline,"
-            "routes.legs.steps.navigationInstruction.instructions"
-        ),
-    }
-
-    response = requests.post(ROUTES_URL, json=body, headers=headers, timeout=20)
-    if not response.ok:
-        print("\n========= GOOGLE ROUTES BASIC RETRY ERROR =========")
-        print("STATUS:", response.status_code)
-        print("BODY:", response.text)
-        print("REQUEST BODY:", body)
-        print("==================================================\n")
-    response.raise_for_status()
-
-    payload = response.json()
-    routes = payload.get("routes", [])
-    if not routes:
-        raise RuntimeError("No routes returned by Google Routes API basic retry.")
-
-    results = []
-    for idx, route in enumerate(routes, start=1):
-        duration_s = _parse_duration_seconds(route.get("duration"))
-        distance_m = float(route.get("distanceMeters", 0.0))
-        encoded_polyline = ((route.get("polyline") or {}).get("encodedPolyline") or "")
-        path_points = decode_google_polyline(encoded_polyline)
-
-        legs = route.get("legs", []) or []
-        leg_durations_s = [_parse_duration_seconds(leg.get("duration")) for leg in legs]
-        leg_distances_m = [float(leg.get("distanceMeters", 0.0)) for leg in legs]
-
-        steps = []
-        step_details = []
-        for leg in legs:
-            for step in leg.get("steps", []) or []:
-                instr = ((step.get("navigationInstruction") or {}).get("instructions"))
-                if not instr:
-                    continue
-                steps.append(instr)
-                step_distance_m = float(step.get("distanceMeters", 0.0))
-                step_poly = ((step.get("polyline") or {}).get("encodedPolyline") or "")
-                step_poly_points = decode_google_polyline(step_poly) if step_poly else []
-                step_details.append({
-                    "instruction": instr,
-                    "distance_m": step_distance_m,
-                    "poly_points": step_poly_points,
-                })
-
-        step_details = _estimate_step_route_indices(path_points, step_details)
-        route_labels = route.get("routeLabels", []) or []
-
-        results.append({
+        route_item = {
             "route_id": f"R{idx}",
             "duration_s": duration_s,
             "distance_m": distance_m,
             "path_points": path_points,
-            "toll_status": False,
+            "toll_status": toll_status,
             "steps": steps,
             "step_details": step_details,
             "leg_durations_s": leg_durations_s,
             "leg_distances_m": leg_distances_m,
             "route_labels": route_labels,
-        })
+        }
+        results.append(_ensure_road_path_points(route_item))
 
     return results
-
-
-def _compute_route_google_robust(
-    origin: dict,
-    destination: dict,
-    selected_stops: List[dict],
-    depart_dt: datetime.datetime,
-    avoid_tolls: bool,
-    fastest_route_only: bool,
-    allow_alternatives: bool,
-) -> List[dict]:
-    primary_error = None
-    try:
-        routes = _compute_route_google(
-            origin=origin,
-            destination=destination,
-            selected_stops=selected_stops,
-            depart_dt=depart_dt,
-            avoid_tolls=avoid_tolls,
-            fastest_route_only=fastest_route_only,
-            allow_alternatives=allow_alternatives,
-        )
-        if _routes_have_usable_road_polyline(routes):
-            return routes
-    except Exception as exc:
-        primary_error = exc
-
-    routes = _compute_route_google_basic(
-        origin=origin,
-        destination=destination,
-        selected_stops=selected_stops,
-        depart_dt=depart_dt,
-        avoid_tolls=avoid_tolls,
-        fastest_route_only=fastest_route_only,
-        allow_alternatives=allow_alternatives,
-    )
-
-    if not _routes_have_usable_road_polyline(routes):
-        if primary_error is not None:
-            raise RuntimeError(
-                f"Google route geometry unavailable after retry. Primary error: {primary_error}"
-            )
-        raise RuntimeError("Google route geometry unavailable after retry.")
-
-    return routes
 
 
 def _search_nearby_chargers_along_route(
@@ -1665,10 +1502,13 @@ def _build_stop_preserving_alternatives(
             for leg_i, choice_idx in enumerate(combo)
         ]
 
-        combined = _build_combined_route_from_legs(
+        combined = _ensure_road_path_points(_build_combined_route_from_legs(
             chosen_legs,
             route_id=f"R{combo_idx}",
-        )
+        ))
+
+        if not _is_usable_road_polyline(combined.get("path_points", []), combined.get("distance_m")):
+            continue
 
         key = (
             round(float(combined["duration_s"]), 1),
@@ -1708,7 +1548,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
     depart_dt = _parse_depart_dt(departure_date, departure_time)
 
     try:
-        stop_routes_raw = _compute_route_google_robust(
+        stop_routes_raw = _compute_route_google(
             origin=origin,
             destination=destination,
             selected_stops=selected_stops,
@@ -1717,6 +1557,13 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             fastest_route_only=fastest_route_only,
             allow_alternatives=not fastest_route_only,
         )
+
+        stop_routes_raw = [
+            _ensure_road_path_points(r) for r in stop_routes_raw
+            if _is_usable_road_polyline(r.get("path_points", []), r.get("distance_m"))
+        ]
+        if not stop_routes_raw:
+            raise RuntimeError("Google returned sparse route geometry only; refusing to draw straight-line route.")
 
         enriched_stop_routes = [
             _enrich_route_metrics(
@@ -1759,10 +1606,13 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                     for r in combined_alt_routes_raw
                 ]
 
-                ranked_stop_routes = _rank_routes_balanced(
+                candidate_ranked_routes = _rank_routes_balanced(
                     enriched_combined_routes,
                     fastest_route_only=False,
                 )
+
+                if candidate_ranked_routes:
+                    ranked_stop_routes = candidate_ranked_routes
 
                 for idx, r in enumerate(ranked_stop_routes, start=1):
                     r["route_id"] = f"R{idx}"
@@ -1789,8 +1639,8 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             {"lat": float(lat), "lng": float(lng)}
             for lat, lng in best_path_points
         ]
-        if not route_points:
-            route_points = _fallback_route_points(origin, destination, selected_stops)
+        if not _is_usable_road_polyline(best_path_points, best.get("distance_m")):
+            raise RuntimeError("Selected route has sparse geometry; refusing to return straight-line route.")
 
         distance_km = float(best["distance_m"]) / 1000.0
         total_kwh = float(best["energy"]["total_kwh"])
