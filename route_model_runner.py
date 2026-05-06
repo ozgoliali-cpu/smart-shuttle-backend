@@ -9,7 +9,10 @@ import requests
 
 SYD_ZONEINFO = ZoneInfo("Australia/Sydney")
 
+BACKEND_BUILD_VERSION = "directions_fallback_polyline_fixed_2026_05_06"
+
 ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
+DIRECTIONS_URL = "https://maps.googleapis.com/maps/api/directions/json"
 PLACES_NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 ELEVATION_API_URL = "https://maps.googleapis.com/maps/api/elevation/json"
@@ -702,6 +705,132 @@ def _compute_route_google(
 
     return results
 
+
+
+def _compute_route_directions_api(
+    origin: dict,
+    destination: dict,
+    selected_stops: List[dict],
+    depart_dt: datetime.datetime,
+    avoid_tolls: bool,
+    fastest_route_only: bool,
+    allow_alternatives: bool,
+) -> List[dict]:
+    """
+    Fallback road-polyline provider using the legacy Google Directions API.
+    This is used only when Routes API returns no usable route geometry.
+    It prevents Flutter from receiving waypoint-only geometry and drawing straight lines.
+    """
+    if not GOOGLE_API_KEY:
+        raise RuntimeError("No Google API key found in text.env or environment variables.")
+
+    params = {
+        "origin": f"{float(origin['lat'])},{float(origin['lng'])}",
+        "destination": f"{float(destination['lat'])},{float(destination['lng'])}",
+        "mode": "driving",
+        "alternatives": "true" if (allow_alternatives and not fastest_route_only) else "false",
+        "departure_time": str(int(depart_dt.timestamp())),
+        "language": "en-AU",
+        "units": "metric",
+        "key": GOOGLE_API_KEY,
+    }
+
+    if selected_stops:
+        params["waypoints"] = "|".join(
+            f"{float(stop['lat'])},{float(stop['lng'])}" for stop in selected_stops
+        )
+
+    if avoid_tolls:
+        params["avoid"] = "tolls"
+
+    response = requests.get(DIRECTIONS_URL, params=params, timeout=20)
+    if not response.ok:
+        print("\n========= GOOGLE DIRECTIONS RAW ERROR =========")
+        print("STATUS:", response.status_code)
+        print("BODY:", response.text)
+        print("PARAMS:", {k: v for k, v in params.items() if k != "key"})
+        print("==============================================\n")
+    response.raise_for_status()
+    payload = response.json()
+
+    status = payload.get("status")
+    if status != "OK":
+        raise RuntimeError(f"Google Directions API returned status {status}: {payload.get('error_message', '')}")
+
+    routes = payload.get("routes", []) or []
+    if not routes:
+        raise RuntimeError("No routes returned by Google Directions API.")
+
+    results = []
+    for idx, route in enumerate(routes, start=1):
+        overview = ((route.get("overview_polyline") or {}).get("points") or "")
+        path_points = decode_google_polyline(overview)
+
+        duration_s = 0.0
+        distance_m = 0.0
+        leg_durations_s: List[float] = []
+        leg_distances_m: List[float] = []
+        steps: List[str] = []
+        step_details: List[dict] = []
+
+        for leg in route.get("legs", []) or []:
+            dur_obj = leg.get("duration_in_traffic") or leg.get("duration") or {}
+            dist_obj = leg.get("distance") or {}
+            leg_duration_s = float(dur_obj.get("value", 0.0) or 0.0)
+            leg_distance_m = float(dist_obj.get("value", 0.0) or 0.0)
+            duration_s += leg_duration_s
+            distance_m += leg_distance_m
+            leg_durations_s.append(leg_duration_s)
+            leg_distances_m.append(leg_distance_m)
+
+            for step in leg.get("steps", []) or []:
+                instr = (step.get("html_instructions") or "").strip()
+                if not instr:
+                    continue
+                steps.append(instr)
+                step_distance_m = float(((step.get("distance") or {}).get("value", 0.0)) or 0.0)
+                step_poly = ((step.get("polyline") or {}).get("points") or "")
+                step_poly_points = decode_google_polyline(step_poly) if step_poly else []
+                step_details.append(
+                    {
+                        "instruction": instr,
+                        "distance_m": step_distance_m,
+                        "poly_points": step_poly_points,
+                    }
+                )
+
+        # If the overview polyline is sparse, the concatenated step polylines usually
+        # provide a stronger road geometry.
+        if not _is_usable_road_polyline(path_points, distance_m):
+            step_path = _extract_path_from_step_details(step_details)
+            if _is_usable_road_polyline(step_path, distance_m):
+                path_points = step_path
+
+        toll_status = False
+        warnings = route.get("warnings", []) or []
+        if any("toll" in str(w).lower() for w in warnings):
+            toll_status = True
+
+        route_item = {
+            "route_id": f"R{idx}",
+            "duration_s": duration_s,
+            "distance_m": distance_m,
+            "path_points": path_points,
+            "toll_status": toll_status,
+            "steps": steps,
+            "step_details": step_details,
+            "leg_durations_s": leg_durations_s,
+            "leg_distances_m": leg_distances_m,
+            "route_labels": ["DIRECTIONS_API_FALLBACK"],
+        }
+        route_item = _normalise_route_geometry(route_item)
+        route_item["step_details"] = _estimate_step_route_indices(
+            route_item.get("path_points", []) or [],
+            route_item.get("step_details", []) or [],
+        )
+        results.append(route_item)
+
+    return results
 
 def _search_nearby_chargers_along_route(
     path_points: List[Tuple[float, float]],
@@ -1611,24 +1740,45 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
     depart_dt = _parse_depart_dt(departure_date, departure_time)
 
     try:
-        stop_routes_raw = _compute_route_google(
-            origin=origin,
-            destination=destination,
-            selected_stops=selected_stops,
-            depart_dt=depart_dt,
-            avoid_tolls=avoid_tolls,
-            fastest_route_only=fastest_route_only,
-            allow_alternatives=not fastest_route_only,
-        )
+        try:
+            stop_routes_raw = _compute_route_google(
+                origin=origin,
+                destination=destination,
+                selected_stops=selected_stops,
+                depart_dt=depart_dt,
+                avoid_tolls=avoid_tolls,
+                fastest_route_only=fastest_route_only,
+                allow_alternatives=not fastest_route_only,
+            )
+        except Exception as routes_api_error:
+            print("Routes API failed, trying Directions API fallback:", routes_api_error)
+            stop_routes_raw = []
 
         stop_routes_raw = [_normalise_route_geometry(r) for r in stop_routes_raw]
         stop_routes_raw = [
             r for r in stop_routes_raw
             if _is_usable_road_polyline(r.get("path_points", []), r.get("distance_m"))
         ]
+
+        if not stop_routes_raw:
+            stop_routes_raw = _compute_route_directions_api(
+                origin=origin,
+                destination=destination,
+                selected_stops=selected_stops,
+                depart_dt=depart_dt,
+                avoid_tolls=avoid_tolls,
+                fastest_route_only=fastest_route_only,
+                allow_alternatives=not fastest_route_only,
+            )
+            stop_routes_raw = [_normalise_route_geometry(r) for r in stop_routes_raw]
+            stop_routes_raw = [
+                r for r in stop_routes_raw
+                if _is_usable_road_polyline(r.get("path_points", []), r.get("distance_m"))
+            ]
+
         if not stop_routes_raw:
             raise RuntimeError(
-                "Google Routes API returned no usable road polyline. Check API key, Routes API access, field mask, and backend logs."
+                "Google returned no usable road polyline from Routes API or Directions API. Check API key permissions and backend terminal logs."
             )
 
         enriched_stop_routes = [
@@ -1749,6 +1899,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
 
         
         return {
+            "backend_build_version": BACKEND_BUILD_VERSION,
             "selected_route": {
                 "route_id": best["route_id"],
                 "travel_time_min": round(duration_s / 60.0, 1),
@@ -1860,6 +2011,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
         charging_schedule = _charging_schedule_from_soc(enriched["soc"]["end_soc_pct"], 0)
 
         return {
+            "backend_build_version": BACKEND_BUILD_VERSION,
             "selected_route": {
                 "route_id": "R1",
                 "travel_time_min": round(duration_min, 1),
