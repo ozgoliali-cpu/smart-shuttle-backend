@@ -9,6 +9,8 @@ import requests
 
 SYD_ZONEINFO = ZoneInfo("Australia/Sydney")
 
+ROUTE_MODEL_VERSION = "no500_polyline_final_2026_05_06"
+
 ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 PLACES_NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -1344,37 +1346,48 @@ def _ensure_response_metadata(route: dict, fallback_index: int = 1) -> dict:
 
 
 def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> dict:
+    route = _ensure_response_metadata(route)
+    energy = route.get("energy", {}) or {}
+    soc = route.get("soc", {}) or {}
+    sm = route.get("sustainability_metrics", {}) or {}
+
+    def _num(map_obj, key, default=0.0):
+        try:
+            return float(map_obj.get(key, default) if isinstance(map_obj, dict) else default)
+        except Exception:
+            return float(default)
+
     return {
-        "route_id": route["route_id"],
-        "travel_time_min": round(float(route["duration_s"]) / 60.0, 1),
-        "distance_km": round(float(route["distance_m"]) / 1000.0, 2),
-        "arrival_time": route["arrival_time"],
-        "energy_kwh": route["energy"]["total_kwh"],
-        "traction_kwh": route["energy"]["traction_kwh"],
-        "auxiliary_kwh": route["energy"]["auxiliary_kwh"],
-        "onboard_kwh": route["energy"]["onboard_kwh"],
-        "device_kwh": route["energy"]["device_kwh"],
-        "traction_base_kwh": route["energy"]["traction_base_kwh"],
-        "slope_uphill_kwh": route["energy"]["slope_uphill_kwh"],
-        "slope_regen_kwh": route["energy"]["slope_regen_kwh"],
-        "slope_net_kwh": route["energy"]["slope_net_kwh"],
-        "elevation_api_used": route["energy"]["elevation_api_used"],
-        "hvac_kwh": route["energy"]["hvac_kwh"],
-        "hvac_kw_est": route["energy"]["hvac_kw_est"],
-        "outdoor_temp_c": route["energy"]["outdoor_temp_c"],
-        "avg_trip_power_kw": route["energy"]["avg_trip_power_kw"],
-        "energy_per_km": route["sustainability_metrics"]["energy_per_km"],
-        "energy_per_passenger_km": route["sustainability_metrics"]["energy_per_passenger_km"],
-        "emissions_kg_co2e": route["sustainability_metrics"]["emissions_kg_co2e"],
-        "avg_speed_kmh": route["sustainability_metrics"]["avg_speed_kmh"],
-        "soc_start_pct": route["soc"]["start_soc_pct"],
-        "soc_end_pct": route["soc"]["end_soc_pct"],
-        "soc_drop_pp": route["soc"]["soc_drop_pp"],
-        "charging_energy_to_recover_90_soc_kwh": route["soc"]["charging_energy_to_recover_90_soc_kwh"],
-        "required_charger_power_30min_kw": route["soc"]["required_charger_power_30min_kw"],
-        "charging_time_ac_22kw": route["soc"]["charging_time_ac_22kw"],
-        "charging_time_dc_50kw": route["soc"]["charging_time_dc_50kw"],
-        "remaining_trips_before_charge": route["soc"]["remaining_trips_before_charge"],
+        "route_id": route.get("route_id", "R1"),
+        "travel_time_min": round(float(route.get("duration_s", 0.0) or 0.0) / 60.0, 1),
+        "distance_km": round(float(route.get("distance_m", 0.0) or 0.0) / 1000.0, 2),
+        "arrival_time": route.get("arrival_time", "-"),
+        "energy_kwh": energy.get("total_kwh", 0.0),
+        "traction_kwh": energy.get("traction_kwh", 0.0),
+        "auxiliary_kwh": energy.get("auxiliary_kwh", 0.0),
+        "onboard_kwh": energy.get("onboard_kwh", 0.0),
+        "device_kwh": energy.get("device_kwh", 0.0),
+        "traction_base_kwh": energy.get("traction_base_kwh", 0.0),
+        "slope_uphill_kwh": energy.get("slope_uphill_kwh", 0.0),
+        "slope_regen_kwh": energy.get("slope_regen_kwh", 0.0),
+        "slope_net_kwh": energy.get("slope_net_kwh", 0.0),
+        "elevation_api_used": energy.get("elevation_api_used", False),
+        "hvac_kwh": energy.get("hvac_kwh", 0.0),
+        "hvac_kw_est": energy.get("hvac_kw_est", 0.0),
+        "outdoor_temp_c": energy.get("outdoor_temp_c"),
+        "avg_trip_power_kw": energy.get("avg_trip_power_kw", 0.0),
+        "energy_per_km": sm.get("energy_per_km", 0.0),
+        "energy_per_passenger_km": sm.get("energy_per_passenger_km", 0.0),
+        "emissions_kg_co2e": sm.get("emissions_kg_co2e", 0.0),
+        "avg_speed_kmh": sm.get("avg_speed_kmh", 0.0),
+        "soc_start_pct": soc.get("start_soc_pct", 90.0),
+        "soc_end_pct": soc.get("end_soc_pct", 0.0),
+        "soc_drop_pp": soc.get("soc_drop_pp", 0.0),
+        "charging_energy_to_recover_90_soc_kwh": soc.get("charging_energy_to_recover_90_soc_kwh", 0.0),
+        "required_charger_power_30min_kw": soc.get("required_charger_power_30min_kw", 0.0),
+        "charging_time_ac_22kw": soc.get("charging_time_ac_22kw", "00:00"),
+        "charging_time_dc_50kw": soc.get("charging_time_dc_50kw", "00:00"),
+        "remaining_trips_before_charge": soc.get("remaining_trips_before_charge", 0),
         "tolls": "Toll applies" if route.get("toll_status") else "No toll",
         "route_sustainability_index": route.get("route_sustainability_index", 0.75),
         "score": round(float(route.get("score", 0.25)), 4),
