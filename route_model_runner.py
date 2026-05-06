@@ -1347,7 +1347,38 @@ def _enrich_route_metrics(
     return enriched
 
 
+def _safe_route_sustainability_index(route: dict) -> float:
+    for key in (
+        "route_sustainability_index",
+        "sustainability_route_index",
+        "susutainability_route_index",
+        "sustainability_score",
+        "score",
+    ):
+        value = route.get(key)
+        try:
+            if value is not None:
+                return round(float(value), 3)
+        except Exception:
+            continue
+    return 0.75
+
+
+def _ensure_route_response_metadata(route: dict) -> dict:
+    item = dict(route)
+    rsi = _safe_route_sustainability_index(item)
+    item["route_sustainability_index"] = rsi
+    item["sustainability_route_index"] = rsi
+    item["susutainability_route_index"] = rsi
+    item.setdefault("score", round(1.0 - rsi, 4))
+    item.setdefault("pareto_front_rank", 1)
+    item.setdefault("topsis_closeness", round(rsi, 6))
+    item.setdefault("recommendation_basis", "Route metadata fallback applied")
+    return item
+
+
 def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> dict:
+    route = _ensure_route_response_metadata(route)
     return {
         "route_id": route["route_id"],
         "travel_time_min": round(float(route["duration_s"]) / 60.0, 1),
@@ -1380,8 +1411,10 @@ def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> 
         "charging_time_dc_50kw": route["soc"]["charging_time_dc_50kw"],
         "remaining_trips_before_charge": route["soc"]["remaining_trips_before_charge"],
         "tolls": "Toll applies" if route.get("toll_status") else "No toll",
-        "route_sustainability_index": route["route_sustainability_index"],
-        "score": round(route["score"], 4),
+        "route_sustainability_index": _safe_route_sustainability_index(route),
+        "sustainability_route_index": _safe_route_sustainability_index(route),
+        "susutainability_route_index": _safe_route_sustainability_index(route),
+        "score": round(float(route.get("score", 1.0 - _safe_route_sustainability_index(route))), 4),
         "pareto_front_rank": route.get("pareto_front_rank"),                
         "topsis_closeness": route.get("topsis_closeness"),
         "recommendation_basis": route.get("recommendation_basis", ""),
@@ -1613,7 +1646,9 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             fastest_route_only=fastest_route_only,
         )
 
-        for r in ranked_stop_routes:
+        for idx, r in enumerate(ranked_stop_routes, start=1):
+            r.update(_ensure_route_response_metadata(r))
+            r["route_id"] = r.get("route_id") or f"R{idx}"
             r["arrival_time"] = (
                 depart_dt + datetime.timedelta(seconds=float(r["duration_s"]))
             ).strftime("%H:%M")
@@ -1651,6 +1686,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 )
 
                 for idx, r in enumerate(ranked_stop_routes, start=1):
+                    r.update(_ensure_route_response_metadata(r))
                     r["route_id"] = f"R{idx}"
                     r["arrival_time"] = (
                         depart_dt + datetime.timedelta(
@@ -1661,7 +1697,10 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
-        best = ranked_stop_routes[0]
+        if not ranked_stop_routes:
+            raise RuntimeError("No ranked routes available after geometry and feasibility checks.")
+        ranked_stop_routes = [_ensure_route_response_metadata(r) for r in ranked_stop_routes]
+        best = _ensure_route_response_metadata(ranked_stop_routes[0])
         duration_s = float(best["duration_s"])  
 
               
@@ -1716,7 +1755,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 "distance_km": round(distance_km, 2),
                 "arrival_time": selected_arrival_dt.strftime("%H:%M"),
                 "tolls": "Toll applies" if best.get("toll_status") else "No toll",
-                "sustainability_score": best["route_sustainability_index"],
+                "sustainability_score": _safe_route_sustainability_index(best),
                 "pareto_front_rank": best.get("pareto_front_rank"),
                 "topsis_closeness": best.get("topsis_closeness"),
                 "energy_saving_vs_highest_energy_route_pct": round(saving_vs_highest_pct, 1),
@@ -1762,11 +1801,13 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             "chargers": chargers,
             "queue_risk": queue_risk,
             "suggested_charging_schedule": charging_schedule,
-            "route_sustainability_index": best["route_sustainability_index"],
+            "route_sustainability_index": _safe_route_sustainability_index(best),
+            "sustainability_route_index": _safe_route_sustainability_index(best),
+            "susutainability_route_index": _safe_route_sustainability_index(best),
             "avg_speed_kmh": best["sustainability_metrics"]["avg_speed_kmh"],
             "remaining_trips_before_charge": best["soc"]["remaining_trips_before_charge"],
             "recommended_route": best["route_id"],
-            "recommendation_basis": best["recommendation_basis"],
+            "recommendation_basis": best.get("recommendation_basis", "Route selected using available optimisation metadata"),
             "all_routes": all_routes_payload,
             "alternatives_note": (
                 "" if (len(ranked_stop_routes) > 1 or fastest_route_only) else
@@ -1813,6 +1854,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             selected_stops=selected_stops,
         )
         enriched["arrival_time"] = (depart_dt + datetime.timedelta(seconds=duration_s)).strftime("%H:%M")
+        enriched = _ensure_route_response_metadata(enriched)
 
         queue_risk = "Unknown"
         charging_schedule = _charging_schedule_from_soc(enriched["soc"]["end_soc_pct"], 0)
@@ -1863,6 +1905,8 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             "queue_risk": queue_risk,
             "suggested_charging_schedule": charging_schedule,
             "route_sustainability_index": 0.75,
+            "sustainability_route_index": 0.75,
+            "susutainability_route_index": 0.75,
             "avg_speed_kmh": enriched["sustainability_metrics"]["avg_speed_kmh"],
             "remaining_trips_before_charge": enriched["soc"]["remaining_trips_before_charge"],
             "recommended_route": "R1",
