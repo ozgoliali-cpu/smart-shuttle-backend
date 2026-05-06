@@ -9,8 +9,6 @@ import requests
 
 SYD_ZONEINFO = ZoneInfo("Australia/Sydney")
 
-ROUTE_MODEL_VERSION = "no500_polyline_final_2026_05_06"
-
 ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 PLACES_NEARBY_URL = "https://places.googleapis.com/v1/places:searchNearby"
 OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
@@ -217,22 +215,33 @@ def _fallback_route_points(origin: dict, destination: dict, stops: List[dict]) -
     return points
 
 
+
+def _dedupe_consecutive_points(points: List[Tuple[float, float]], min_gap_m: float = 0.5) -> List[Tuple[float, float]]:
+    """Remove duplicate/near-duplicate geometry points while preserving route order."""
+    cleaned: List[Tuple[float, float]] = []
+    for item in points or []:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            pt = (float(item[0]), float(item[1]))
+        except Exception:
+            continue
+        if not cleaned:
+            cleaned.append(pt)
+            continue
+        if _haversine_m(cleaned[-1][0], cleaned[-1][1], pt[0], pt[1]) >= min_gap_m:
+            cleaned.append(pt)
+    return cleaned
+
+
 def _polyline_length_m(points: List[Tuple[float, float]]) -> float:
-    if len(points) < 2:
+    pts = _dedupe_consecutive_points(points or [])
+    if len(pts) < 2:
         return 0.0
     total = 0.0
-    for i in range(len(points) - 1):
-        total += _haversine_m(points[i][0], points[i][1], points[i + 1][0], points[i + 1][1])
+    for i in range(len(pts) - 1):
+        total += _haversine_m(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1])
     return total
-
-
-def _dedupe_consecutive_points(points: List[Tuple[float, float]]) -> List[Tuple[float, float]]:
-    out: List[Tuple[float, float]] = []
-    for lat, lng in points or []:
-        item = (float(lat), float(lng))
-        if not out or _haversine_m(out[-1][0], out[-1][1], item[0], item[1]) > 1.0:
-            out.append(item)
-    return out
 
 
 def _extract_path_from_step_details(step_details: List[dict]) -> List[Tuple[float, float]]:
@@ -248,36 +257,53 @@ def _extract_path_from_step_details(step_details: List[dict]) -> List[Tuple[floa
 
 
 def _is_usable_road_polyline(points: List[Tuple[float, float]], distance_m: float | None = None) -> bool:
-    points = _dedupe_consecutive_points(points or [])
-    if len(points) < 8:
+    """
+    Returns True only for a route-like polyline. This prevents waypoint-only
+    geometry from being sent to Flutter and drawn as straight lines.
+    """
+    pts = _dedupe_consecutive_points(points or [])
+    if len(pts) < 8:
         return False
-    length_m = _polyline_length_m(points)
+    length_m = _polyline_length_m(pts)
     if length_m < 250.0:
         return False
-    if distance_m and distance_m > 1000.0 and length_m < (0.55 * float(distance_m)):
-        return False
+    if distance_m and float(distance_m) > 1000.0:
+        # For a real road route, polyline length should be reasonably close to
+        # Google distance. Too-short geometry means it is probably sparse.
+        if length_m < 0.45 * float(distance_m):
+            return False
     return True
 
 
-def _ensure_road_path_points(route_row: dict) -> dict:
+def _normalise_route_geometry(route_row: dict) -> dict:
+    """
+    Prefer Google's route-level polyline. If it is missing/sparse, rebuild the
+    route from step polylines. Never deliberately manufacture a straight-line
+    origin-to-destination geometry here.
+    """
     item = dict(route_row)
     distance_m = float(item.get("distance_m", 0.0) or 0.0)
-    path_points = _dedupe_consecutive_points(item.get("path_points", []) or [])
+    route_path = _dedupe_consecutive_points(item.get("path_points", []) or [])
 
-    if _is_usable_road_polyline(path_points, distance_m):
-        item["path_points"] = path_points
-        item["geometry_source"] = "route_polyline"
+    if _is_usable_road_polyline(route_path, distance_m):
+        item["path_points"] = route_path
+        item["geometry_source"] = "google_route_polyline"
+        item["geometry_quality"] = "road"
         return item
 
     step_path = _extract_path_from_step_details(item.get("step_details", []) or [])
     if _is_usable_road_polyline(step_path, distance_m):
         item["path_points"] = step_path
         item["step_details"] = _estimate_step_route_indices(step_path, item.get("step_details", []) or [])
-        item["geometry_source"] = "step_polylines"
+        item["geometry_source"] = "google_step_polylines"
+        item["geometry_quality"] = "road"
         return item
 
-    item["path_points"] = path_points
-    item["geometry_source"] = "sparse_or_fallback"
+    # Keep the original points for diagnostics, but mark them unsafe. run_route_model()
+    # will reject this instead of letting the app draw a misleading straight line.
+    item["path_points"] = route_path
+    item["geometry_source"] = "sparse_or_missing_google_polyline"
+    item["geometry_quality"] = "sparse"
     return item
 
 
@@ -652,8 +678,6 @@ def _compute_route_google(
                     }
                 )
 
-        step_details = _estimate_step_route_indices(path_points, step_details)
-
         toll_status = ((route.get("travelAdvisory") or {}).get("tollInfo")) is not None
         route_labels = route.get("routeLabels", []) or []
 
@@ -669,7 +693,12 @@ def _compute_route_google(
             "leg_distances_m": leg_distances_m,
             "route_labels": route_labels,
         }
-        results.append(_ensure_road_path_points(route_item))
+        route_item = _normalise_route_geometry(route_item)
+        route_item["step_details"] = _estimate_step_route_indices(
+            route_item.get("path_points", []) or [],
+            route_item.get("step_details", []) or [],
+        )
+        results.append(route_item)
 
     return results
 
@@ -1318,82 +1347,46 @@ def _enrich_route_metrics(
     return enriched
 
 
-def _ensure_response_metadata(route: dict, fallback_index: int = 1) -> dict:
-    """Ensure route has response/ranking fields so API never fails with missing metadata."""
-    if route is None:
-        return {}
-
-    default_index = 0.75
-    try:
-        energy = float((route.get("energy") or {}).get("total_kwh", 0.0) or 0.0)
-        distance_km = float(route.get("distance_m", 0.0) or 0.0) / 1000.0
-        if distance_km > 0 and energy > 0:
-            intensity = energy / distance_km
-            # Keep within a conservative visible range for fallback/unranked routes.
-            default_index = max(0.35, min(0.85, 0.85 - max(0.0, intensity - 0.22)))
-    except Exception:
-        default_index = 0.75
-
-    route.setdefault("route_sustainability_index", round(default_index, 3))
-    route.setdefault("score", round(1.0 - float(route.get("route_sustainability_index", default_index)), 4))
-    route.setdefault("pareto_front_rank", fallback_index)
-    route.setdefault("topsis_closeness", round(float(route.get("route_sustainability_index", default_index)), 6))
-    route.setdefault(
-        "recommendation_basis",
-        "Route selected using available travel time, distance, energy and SOC metrics",
-    )
-    return route
-
-
 def _route_payload(route: dict, route_kind: str, selected_stops: List[dict]) -> dict:
-    route = _ensure_response_metadata(route)
-    energy = route.get("energy", {}) or {}
-    soc = route.get("soc", {}) or {}
-    sm = route.get("sustainability_metrics", {}) or {}
-
-    def _num(map_obj, key, default=0.0):
-        try:
-            return float(map_obj.get(key, default) if isinstance(map_obj, dict) else default)
-        except Exception:
-            return float(default)
-
     return {
-        "route_id": route.get("route_id", "R1"),
-        "travel_time_min": round(float(route.get("duration_s", 0.0) or 0.0) / 60.0, 1),
-        "distance_km": round(float(route.get("distance_m", 0.0) or 0.0) / 1000.0, 2),
-        "arrival_time": route.get("arrival_time", "-"),
-        "energy_kwh": energy.get("total_kwh", 0.0),
-        "traction_kwh": energy.get("traction_kwh", 0.0),
-        "auxiliary_kwh": energy.get("auxiliary_kwh", 0.0),
-        "onboard_kwh": energy.get("onboard_kwh", 0.0),
-        "device_kwh": energy.get("device_kwh", 0.0),
-        "traction_base_kwh": energy.get("traction_base_kwh", 0.0),
-        "slope_uphill_kwh": energy.get("slope_uphill_kwh", 0.0),
-        "slope_regen_kwh": energy.get("slope_regen_kwh", 0.0),
-        "slope_net_kwh": energy.get("slope_net_kwh", 0.0),
-        "elevation_api_used": energy.get("elevation_api_used", False),
-        "hvac_kwh": energy.get("hvac_kwh", 0.0),
-        "hvac_kw_est": energy.get("hvac_kw_est", 0.0),
-        "outdoor_temp_c": energy.get("outdoor_temp_c"),
-        "avg_trip_power_kw": energy.get("avg_trip_power_kw", 0.0),
-        "energy_per_km": sm.get("energy_per_km", 0.0),
-        "energy_per_passenger_km": sm.get("energy_per_passenger_km", 0.0),
-        "emissions_kg_co2e": sm.get("emissions_kg_co2e", 0.0),
-        "avg_speed_kmh": sm.get("avg_speed_kmh", 0.0),
-        "soc_start_pct": soc.get("start_soc_pct", 90.0),
-        "soc_end_pct": soc.get("end_soc_pct", 0.0),
-        "soc_drop_pp": soc.get("soc_drop_pp", 0.0),
-        "charging_energy_to_recover_90_soc_kwh": soc.get("charging_energy_to_recover_90_soc_kwh", 0.0),
-        "required_charger_power_30min_kw": soc.get("required_charger_power_30min_kw", 0.0),
-        "charging_time_ac_22kw": soc.get("charging_time_ac_22kw", "00:00"),
-        "charging_time_dc_50kw": soc.get("charging_time_dc_50kw", "00:00"),
-        "remaining_trips_before_charge": soc.get("remaining_trips_before_charge", 0),
+        "route_id": route["route_id"],
+        "travel_time_min": round(float(route["duration_s"]) / 60.0, 1),
+        "distance_km": round(float(route["distance_m"]) / 1000.0, 2),
+        "arrival_time": route["arrival_time"],
+        "energy_kwh": route["energy"]["total_kwh"],
+        "traction_kwh": route["energy"]["traction_kwh"],
+        "auxiliary_kwh": route["energy"]["auxiliary_kwh"],
+        "onboard_kwh": route["energy"]["onboard_kwh"],
+        "device_kwh": route["energy"]["device_kwh"],
+        "traction_base_kwh": route["energy"]["traction_base_kwh"],
+        "slope_uphill_kwh": route["energy"]["slope_uphill_kwh"],
+        "slope_regen_kwh": route["energy"]["slope_regen_kwh"],
+        "slope_net_kwh": route["energy"]["slope_net_kwh"],
+        "elevation_api_used": route["energy"]["elevation_api_used"],
+        "hvac_kwh": route["energy"]["hvac_kwh"],
+        "hvac_kw_est": route["energy"]["hvac_kw_est"],
+        "outdoor_temp_c": route["energy"]["outdoor_temp_c"],
+        "avg_trip_power_kw": route["energy"]["avg_trip_power_kw"],
+        "energy_per_km": route["sustainability_metrics"]["energy_per_km"],
+        "energy_per_passenger_km": route["sustainability_metrics"]["energy_per_passenger_km"],
+        "emissions_kg_co2e": route["sustainability_metrics"]["emissions_kg_co2e"],
+        "avg_speed_kmh": route["sustainability_metrics"]["avg_speed_kmh"],
+        "soc_start_pct": route["soc"]["start_soc_pct"],
+        "soc_end_pct": route["soc"]["end_soc_pct"],
+        "soc_drop_pp": route["soc"]["soc_drop_pp"],
+        "charging_energy_to_recover_90_soc_kwh": route["soc"]["charging_energy_to_recover_90_soc_kwh"],
+        "required_charger_power_30min_kw": route["soc"]["required_charger_power_30min_kw"],
+        "charging_time_ac_22kw": route["soc"]["charging_time_ac_22kw"],
+        "charging_time_dc_50kw": route["soc"]["charging_time_dc_50kw"],
+        "remaining_trips_before_charge": route["soc"]["remaining_trips_before_charge"],
         "tolls": "Toll applies" if route.get("toll_status") else "No toll",
-        "route_sustainability_index": route.get("route_sustainability_index", 0.75),
-        "score": round(float(route.get("score", 0.25)), 4),
+        "route_sustainability_index": route["route_sustainability_index"],
+        "score": round(route["score"], 4),
         "pareto_front_rank": route.get("pareto_front_rank"),                
         "topsis_closeness": route.get("topsis_closeness"),
         "recommendation_basis": route.get("recommendation_basis", ""),
+        "geometry_source": route.get("geometry_source", "unknown"),
+        "geometry_quality": route.get("geometry_quality", "unknown"),
         "route_points": [
             {"lat": float(lat), "lng": float(lng)}
             for lat, lng in route.get("path_points", [])
@@ -1542,13 +1535,10 @@ def _build_stop_preserving_alternatives(
             for leg_i, choice_idx in enumerate(combo)
         ]
 
-        combined = _ensure_road_path_points(_build_combined_route_from_legs(
+        combined = _build_combined_route_from_legs(
             chosen_legs,
             route_id=f"R{combo_idx}",
-        ))
-
-        if not _is_usable_road_polyline(combined.get("path_points", []), combined.get("distance_m")):
-            continue
+        )
 
         key = (
             round(float(combined["duration_s"]), 1),
@@ -1598,12 +1588,15 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             allow_alternatives=not fastest_route_only,
         )
 
+        stop_routes_raw = [_normalise_route_geometry(r) for r in stop_routes_raw]
         stop_routes_raw = [
-            _ensure_road_path_points(r) for r in stop_routes_raw
+            r for r in stop_routes_raw
             if _is_usable_road_polyline(r.get("path_points", []), r.get("distance_m"))
         ]
         if not stop_routes_raw:
-            raise RuntimeError("Google returned sparse route geometry only; refusing to draw straight-line route.")
+            raise RuntimeError(
+                "Google Routes API returned no usable road polyline. Check API key, Routes API access, field mask, and backend logs."
+            )
 
         enriched_stop_routes = [
             _enrich_route_metrics(
@@ -1636,6 +1629,12 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                     avoid_tolls=avoid_tolls,
                 )
 
+                combined_alt_routes_raw = [_normalise_route_geometry(r) for r in combined_alt_routes_raw]
+                combined_alt_routes_raw = [
+                    r for r in combined_alt_routes_raw
+                    if _is_usable_road_polyline(r.get("path_points", []), r.get("distance_m"))
+                ]
+
                 enriched_combined_routes = [
                     _enrich_route_metrics(
                         route=r,
@@ -1646,13 +1645,10 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                     for r in combined_alt_routes_raw
                 ]
 
-                candidate_ranked_routes = _rank_routes_balanced(
+                ranked_stop_routes = _rank_routes_balanced(
                     enriched_combined_routes,
                     fastest_route_only=False,
                 )
-
-                if candidate_ranked_routes:
-                    ranked_stop_routes = candidate_ranked_routes
 
                 for idx, r in enumerate(ranked_stop_routes, start=1):
                     r["route_id"] = f"R{idx}"
@@ -1665,9 +1661,6 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
-        for idx, r in enumerate(ranked_stop_routes, start=1):
-            _ensure_response_metadata(r, fallback_index=idx)
-
         best = ranked_stop_routes[0]
         duration_s = float(best["duration_s"])  
 
@@ -1677,13 +1670,16 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
         else:
             selected_arrival_dt = depart_dt + datetime.timedelta(seconds=duration_s)
 
+        best = _normalise_route_geometry(best)
         best_path_points = best.get("path_points", [])
+        if not _is_usable_road_polyline(best_path_points, best.get("distance_m")):
+            raise RuntimeError(
+                "Selected route has no usable road polyline. Refusing to send straight-line geometry to the app."
+            )
         route_points = [
             {"lat": float(lat), "lng": float(lng)}
             for lat, lng in best_path_points
         ]
-        if not _is_usable_road_polyline(best_path_points, best.get("distance_m")):
-            raise RuntimeError("Selected route has sparse geometry; refusing to return straight-line route.")
 
         distance_km = float(best["distance_m"]) / 1000.0
         total_kwh = float(best["energy"]["total_kwh"])
@@ -1704,7 +1700,6 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
 
         all_routes_payload = []
         for idx, route in enumerate(ranked_stop_routes):
-            _ensure_response_metadata(route, fallback_index=idx + 1)
             all_routes_payload.append(
                 _route_payload(
                     route,
@@ -1721,7 +1716,7 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 "distance_km": round(distance_km, 2),
                 "arrival_time": selected_arrival_dt.strftime("%H:%M"),
                 "tolls": "Toll applies" if best.get("toll_status") else "No toll",
-                "sustainability_score": best.get("route_sustainability_index", 0.75),
+                "sustainability_score": best["route_sustainability_index"],
                 "pareto_front_rank": best.get("pareto_front_rank"),
                 "topsis_closeness": best.get("topsis_closeness"),
                 "energy_saving_vs_highest_energy_route_pct": round(saving_vs_highest_pct, 1),
@@ -1749,6 +1744,9 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
                 for sd in best.get("step_details", [])
             ],
             "route_points": route_points,
+            "geometry_source": best.get("geometry_source", "unknown"),
+            "geometry_quality": best.get("geometry_quality", "unknown"),
+            "route_point_count": len(route_points),
             "selected_stops": [stop["name"] for stop in selected_stops],
             "stop_arrivals": best["stop_arrivals"],
             "stop_indices": best["stop_indices"],
@@ -1764,11 +1762,11 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             "chargers": chargers,
             "queue_risk": queue_risk,
             "suggested_charging_schedule": charging_schedule,
-            "route_sustainability_index": best.get("route_sustainability_index", 0.75),
+            "route_sustainability_index": best["route_sustainability_index"],
             "avg_speed_kmh": best["sustainability_metrics"]["avg_speed_kmh"],
             "remaining_trips_before_charge": best["soc"]["remaining_trips_before_charge"],
             "recommended_route": best["route_id"],
-            "recommendation_basis": best.get("recommendation_basis", "Route selected using available travel time, distance, energy and SOC metrics"),
+            "recommendation_basis": best["recommendation_basis"],
             "all_routes": all_routes_payload,
             "alternatives_note": (
                 "" if (len(ranked_stop_routes) > 1 or fastest_route_only) else
@@ -1815,7 +1813,6 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             selected_stops=selected_stops,
         )
         enriched["arrival_time"] = (depart_dt + datetime.timedelta(seconds=duration_s)).strftime("%H:%M")
-        _ensure_response_metadata(enriched, fallback_index=1)
 
         queue_risk = "Unknown"
         charging_schedule = _charging_schedule_from_soc(enriched["soc"]["end_soc_pct"], 0)
@@ -1845,7 +1842,11 @@ def run_route_model(request_data: Dict[str, Any]) -> Dict[str, Any]:
             },
             "navigation_steps": fallback_route["steps"],
             "step_details": [],
-            "route_points": fallback_points,
+            "route_points": [],
+            "geometry_source": "fallback_disabled_google_route_error",
+            "geometry_quality": "unavailable",
+            "route_point_count": 0,
+            "route_error_message": "Google Routes API failed. No straight-line fallback was returned because it would misrepresent road navigation.",
             "selected_stops": [stop["name"] for stop in selected_stops],
             "stop_arrivals": enriched["stop_arrivals"],
             "stop_indices": enriched["stop_indices"],
